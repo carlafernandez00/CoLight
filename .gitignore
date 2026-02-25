@@ -1,0 +1,10 @@
+.DS_Store
+.vscode/
+Library/
+Temp/
+Build/
+Builds/
+Logs/
+UserSettings/
+*.pth
+*.ckpt
