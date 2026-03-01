@@ -44,3 +44,32 @@ CoLight investigates how to bridge this gap by combining two technical pillars:
 
 - **Android** (min SDK 25) — Meta Quest 3
 - **Standalone** (macOS/Windows) — PC VR development
+
+## Project Structure
+
+```
+Assets/
+├── Prefabs/
+│   ├── Avatar/              — avatar prefabs
+│   └── Lighting/            — lighting rig prefabs
+├── Materials/
+│   ├── Avatar/              — avatar materials (URP Lit)
+│   └── Environment/         — environment/scene materials
+├── Models/
+│   └── Avatar/              — character FBX
+├── Textures/
+│   └── Avatar/              — diffuse, normal, metallic maps
+├── Scenes/
+│   ├── Stage0_Scaffold.unity       — base MR scene (passthrough + avatar)
+│   ├── Stage1_LightEstimation.unity — lighting estimation integration
+│   └── Stage2_UserStudy.unity       — user study conditions
+├── Scripts/
+│   ├── Lighting/            — light estimation & relighting logic
+│   ├── Avatar/              — avatar spawning & control
+│   └── Utils/               — shared helpers
+├── Settings/                — URP assets, renderer, volume profiles, input actions
+├── UserStudy/               — questionnaires, data logging (later)
+├── XR/                      — XR loader and settings configuration
+└── Oculus/                  — Meta/Oculus SDK integration files
+docs/                        — project documentation
+```
