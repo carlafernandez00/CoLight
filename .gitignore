@@ -31,6 +31,17 @@ Thumbs.db
 *.ckpt
 *.onnx
 
+# Crash dumps
+mono_crash.*
+
+# Unity recovery files
+Assets/_Recovery/
+Assets/_Recovery.meta
+
+# SDK samples (re-importable from packages)
+Assets/MRUKSamples/
+Assets/MRUKSamples.meta
+
 # Misc
 .utmp/
 crashlytics-build.properties
