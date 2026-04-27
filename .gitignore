@@ -31,6 +31,24 @@ Thumbs.db
 *.ckpt
 *.onnx
 
+# Crash dumps
+mono_crash.*
+
+# Unity recovery files
+Assets/_Recovery/
+Assets/_Recovery.meta
+
+# SDK samples (re-importable from packages)
+Assets/MRUKSamples/
+Assets/MRUKSamples.meta
+
 # Misc
 .utmp/
 crashlytics-build.properties
+
+# Debug frame captures
+DebugFrames/
+
+# Per-user XR simulation preferences (not shared)
+Assets/XR/UserSimulationSettings/
+Assets/XR/UserSimulationSettings.meta
