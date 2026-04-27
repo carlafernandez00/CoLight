@@ -45,3 +45,10 @@ Assets/MRUKSamples.meta
 # Misc
 .utmp/
 crashlytics-build.properties
+
+# Debug frame captures
+DebugFrames/
+
+# Per-user XR simulation preferences (not shared)
+Assets/XR/UserSimulationSettings/
+Assets/XR/UserSimulationSettings.meta
