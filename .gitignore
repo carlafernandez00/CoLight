@@ -31,6 +31,9 @@ Thumbs.db
 *.ckpt
 *.onnx
 
+# Large 3D model files (re-importable from source)
+Assets/Models/Avatar/*.fbx
+
 # Crash dumps
 mono_crash.*
 
