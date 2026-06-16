@@ -1,0 +1,177 @@
+// EnvironmentToSH.compute
+// Projects an equirectangular environment map (Skybox/Panoramic) to L2 Spherical Harmonics.
+// Outputs 9 coefficients × RGB (27 floats) into _SHCoeffs.
+// Used by EnvironmentSHUpdater.cs to update light probes on Quest 3
+// without relying on DynamicGI (unavailable on Quest 3).
+
+#pragma kernel ProjectEquirectToSH
+
+// --- Inputs ---
+Texture2D<float4>   _EquirectMap;           // Equirectangular environment map (Skybox/Panoramic texture)
+SamplerState        sampler_EquirectMap;     // Sampler for _EquirectMap
+int                 _TexWidth;              // Width  of _EquirectMap in pixels
+int                 _TexHeight;             // Height of _EquirectMap in pixels
+
+// --- Output ---
+// 9 SH coefficients, one float3 (RGB) per coefficient
+// Layout: [c0.rgb, c1.rgb, ..., c8.rgb] → 27 floats total
+RWStructuredBuffer<float3> _SHCoeffs;
+
+// ---------------------------------------------------------------------------
+// L2 Spherical Harmonics basis functions Y_i(dir)
+// These are the real, normalized SH basis functions up to band 2.
+// The constants (0.282095, 0.488603, etc.) are the normalization factors
+// derived from the associated Legendre polynomials.
+//
+// Band 0 (1 function):  constant term
+// Band 1 (3 functions): linear terms in x, y, z
+// Band 2 (5 functions): quadratic terms
+//
+// dir = (x, y, z) unit direction vector, Y-up (Unity convention)
+// ---------------------------------------------------------------------------
+
+// Band 0
+float SH_Y00()           { return 0.282095f; }                                      // 1/(2√π)
+
+// Band 1
+float SH_Y1n1(float3 d)  { return 0.488603f * d.y; }                               // √(3/4π) · y
+float SH_Y10 (float3 d)  { return 0.488603f * d.z; }                               // √(3/4π) · z
+float SH_Y1p1(float3 d)  { return 0.488603f * d.x; }                               // √(3/4π) · x
+
+// Band 2
+float SH_Y2n2(float3 d)  { return 1.092548f * d.x * d.y; }                         // √(15/4π) · xy
+float SH_Y2n1(float3 d)  { return 1.092548f * d.y * d.z; }                         // √(15/4π) · yz
+float SH_Y20 (float3 d)  { return 0.315392f * (3.0f * d.z * d.z - 1.0f); }         // √(5/16π) · (3z²-1)
+float SH_Y2p1(float3 d)  { return 1.092548f * d.x * d.z; }                         // √(15/4π) · xz
+float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }          // √(15/16π) · (x²-y²)
+
+#define PI 3.14159265f
+
+// ---------------------------------------------------------------------------
+// NOTE: Lambertian convolution IS applied (Step 8 below).
+// Unity's SampleSH9 (URP) is a plain polynomial eval with no convolution
+// at runtime, so the Lambertian factors must be pre-baked into the
+// coefficients here (Ramamoorthi & Hanrahan 2001):
+//   Band 0: A0 = π
+//   Band 1: A1 = 2π/3
+//   Band 2: A2 = π/4
+// ---------------------------------------------------------------------------
+
+// Lambertian ZH convolution factors per band
+static const float ZH_A0 = PI;                     // band 0: π
+static const float ZH_A1 = 2.0f * PI / 3.0f;       // band 1: 2π/3
+static const float ZH_A2 = PI / 4.0f;              // band 2: π/4
+
+// Per-coefficient convolution factors (indexed 0..8, matching SH order)
+static const float ZH[9] = {
+    ZH_A0,                              // c0  — band 0
+    ZH_A1, ZH_A1, ZH_A1,               // c1..c3 — band 1
+    ZH_A2, ZH_A2, ZH_A2, ZH_A2, ZH_A2 // c4..c8 — band 2
+};
+
+// ---------------------------------------------------------------------------
+// Kernel: ProjectEquirectToSH
+//
+// Iterates over every pixel of the equirectangular map, converts each pixel
+// to a sphere direction, and accumulates the SH projection integral:
+//
+//   L_i = ∫ L(ω) · Y_i(ω) dω
+//       ≈ Σ_{x,y} L(θ,φ) · Y_i(dir) · dΩ
+//
+// where dΩ = sin(φ) · dφ · dθ is the differential solid angle, which
+// corrects for the equirectangular distortion (poles have less solid angle
+// than the equator).
+//
+// Dispatched as (1,1,1) — single thread, accumulation on CPU-side is minimal
+// since we only read back 27 floats.
+// ---------------------------------------------------------------------------
+
+[numthreads(1, 1, 1)]
+void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
+{
+    // Only one thread does the work
+    if (id.x != 0 || id.y != 0) return;
+
+    // Accumulator for 9 SH coefficients (RGB each)
+    float3 sh[9];
+    [unroll] for (int k = 0; k < 9; k++) sh[k] = float3(0, 0, 0);
+
+    // Accumulate total solid angle weight for normalization
+    float totalWeight = 0.0f;
+
+    for (int y = 0; y < _TexHeight; y++)
+    {
+        for (int x = 0; x < _TexWidth; x++)
+        {
+            // --- Step 1: pixel index → UV in [0,1] ---
+            // +0.5 samples the pixel CENTER, not its corner
+            float u = (x + 0.5f) / (float)_TexWidth;
+            float v = (y + 0.5f) / (float)_TexHeight;
+
+            // --- Step 2: UV → spherical angles ---
+            // Equirectangular mapping:
+            //   u ∈ [0,1]  →  phi   (azimuth)  ∈ [0, 2π]
+            //   v ∈ [0,1]  →  theta (polar)    ∈ [0, π]   (0 = north pole)
+            float phi   = u * 2.0f * PI;
+            float theta = v * PI;
+
+            // --- Step 3: spherical angles → Cartesian unit direction ---
+            // Standard spherical → Cartesian, Y-up (Unity convention)
+            float sinTheta = sin(theta);
+            float3 dir = float3(
+                sinTheta * sin(phi),    // x
+                cos(theta),             // y  (up)
+                sinTheta * cos(phi)     // z
+            );
+
+            // --- Step 4: differential solid angle ---
+            // dΩ = sin(θ) · dθ · dφ
+            // sin(θ) corrects for equirectangular distortion:
+            //   poles   (θ→0 or π): sin(θ)→0, low weight
+            //   equator (θ = π/2):  sin(θ)=1, full weight
+            float dOmega = sinTheta * (PI / _TexHeight) * (2.0f * PI / _TexWidth);
+
+            // --- Step 5: sample environment color at this direction ---
+            float3 color = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), 0).rgb;
+
+            // --- Step 6: accumulate SH projection ---
+            // L_i += color · Y_i(dir) · dΩ
+            sh[0] += color * SH_Y00()      * dOmega;
+            sh[1] += color * SH_Y1n1(dir)  * dOmega;
+            sh[2] += color * SH_Y10(dir)   * dOmega;
+            sh[3] += color * SH_Y1p1(dir)  * dOmega;
+            sh[4] += color * SH_Y2n2(dir)  * dOmega;
+            sh[5] += color * SH_Y2n1(dir)  * dOmega;
+            sh[6] += color * SH_Y20(dir)   * dOmega;
+            sh[7] += color * SH_Y2p1(dir)  * dOmega;
+            sh[8] += color * SH_Y2p2(dir)  * dOmega;
+
+            totalWeight += dOmega;
+        }
+    }
+
+    // --- Step 7: normalize to 4π (total solid angle of a sphere) ---
+    // This corrects for any numerical drift in the discrete sum
+    float normFactor = (4.0f * PI) / totalWeight;
+    [unroll] for (int j = 0; j < 9; j++)
+        sh[j] = sh[j] * normFactor;
+
+    // --- Step 8: Lambertian (ZH) convolution — radiance → irradiance SH ---
+    // Unity's SphericalHarmonicsL2 / bakedProbes stores irradiance SH.
+    // SampleSH9 is a plain polynomial eval with no convolution at runtime,
+    // so the factors must be pre-baked here (Ramamoorthi & Hanrahan 2001):
+    //   Band 0: A0 = π
+    //   Band 1: A1 = 2π/3
+    //   Band 2: A2 = π/4
+    sh[0] *= PI;
+    sh[1] *= (2.0f * PI / 3.0f);
+    sh[2] *= (2.0f * PI / 3.0f);
+    sh[3] *= (2.0f * PI / 3.0f);
+    sh[4] *= (PI / 4.0f);
+    sh[5] *= (PI / 4.0f);
+    sh[6] *= (PI / 4.0f);
+    sh[7] *= (PI / 4.0f);
+    sh[8] *= (PI / 4.0f);
+
+    [unroll] for (int j = 0; j < 9; j++) _SHCoeffs[j] = sh[j];
+}
