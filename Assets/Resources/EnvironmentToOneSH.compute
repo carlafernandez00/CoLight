@@ -110,10 +110,14 @@ void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
 
             // --- Step 2: UV → spherical angles ---
             // Equirectangular mapping:
-            //   u ∈ [0,1]  →  phi   (azimuth)  ∈ [0, 2π]
+            //   u ∈ [0,1]  →  phi   (azimuth)  ∈ [-π, π]
             //   v ∈ [0,1]  →  theta (polar)    ∈ [0, π]   (0 = north pole)
-            float phi   = u * 2.0f * PI;
-            float theta = v * PI;
+            // [phi] Unity's Panoramic skybox maps u=0.5 → forward (+Z), so subtract 0.5
+            // to align the SH projection with the skybox orientation.
+            // [theta] Unity Texture2D stores y=0 at the bottom, so v=0 is the bottom of
+            // the image — flip it so the bottom row maps to the south pole (dir.y=-1).
+            float phi   = (u - 0.5f) * 2.0f * PI;
+            float theta = (1.0f - v) * PI;
 
             // --- Step 3: spherical angles → Cartesian unit direction ---
             // Standard spherical → Cartesian, Y-up (Unity convention)
@@ -163,15 +167,15 @@ void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
     //   Band 0: A0 = π
     //   Band 1: A1 = 2π/3
     //   Band 2: A2 = π/4
-    sh[0] *= PI;
-    sh[1] *= (2.0f * PI / 3.0f);
-    sh[2] *= (2.0f * PI / 3.0f);
-    sh[3] *= (2.0f * PI / 3.0f);
-    sh[4] *= (PI / 4.0f);
-    sh[5] *= (PI / 4.0f);
-    sh[6] *= (PI / 4.0f);
-    sh[7] *= (PI / 4.0f);
-    sh[8] *= (PI / 4.0f);
+    // sh[0] *= PI;
+    // sh[1] *= (2.0f * PI / 3.0f);
+    // sh[2] *= (2.0f * PI / 3.0f);
+    // sh[3] *= (2.0f * PI / 3.0f);
+    // sh[4] *= (PI / 4.0f);
+    // sh[5] *= (PI / 4.0f);
+    // sh[6] *= (PI / 4.0f);
+    // sh[7] *= (PI / 4.0f);
+    // sh[8] *= (PI / 4.0f);
 
     [unroll] for (int j = 0; j < 9; j++) _SHCoeffs[j] = sh[j];
 }
