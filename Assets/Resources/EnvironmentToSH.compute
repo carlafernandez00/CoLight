@@ -56,8 +56,6 @@ float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }        
 #define PI 3.14159265f
 
 // ---------------------------------------------------------------------------
-// NOTE: Lambertian (ZH) convolution IS applied (Ramamoorthi & Hanrahan 2001)
-//
 // Unity's SphericalHarmonicsL2 / SampleSH9 stores irradiance SH and performs
 // a plain polynomial eval with no convolution at render time, so the factors
 // must be pre-baked here:
@@ -96,8 +94,8 @@ void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
             // Equirectangular mapping:
             //   u ∈ [0,1]  →  phi   (azimuth)  ∈ [0, 2π]
             //   v ∈ [0,1]  →  theta (polar)    ∈ [0, π]   (0 = north pole)
-            float phi   = (0.5f - u) * 2.0f * PI;  // invert u to match Unity's left-handed convention
-            float theta = v * PI;
+            float phi   = (u - 0.5f) * 2.0f * PI;  // u=0.5 → phi=0 → +Z, matches Unity's Panoramic skybox convention
+            float theta = (1.0f - v) * PI;         // v=0 → theta=π (south pole), v=1 → theta=0 (north pole)
 
             // --- Step 3: spherical angles → Cartesian unit direction ---
             // Standard spherical → Cartesian, Y-up (Unity convention)
