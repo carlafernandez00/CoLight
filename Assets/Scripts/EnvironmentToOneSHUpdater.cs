@@ -5,7 +5,7 @@ using UnityEngine.Rendering;
 /// Projects the scene's Skybox/Panoramic environment map to L2 Spherical Harmonics
 /// and writes the result to RenderSettings.ambientProbe + LightmapSettings.lightProbes.bakedProbes.
 /// </summary>
-public class EnvironmentSHUpdaterv1 : MonoBehaviour
+public class EnvironmentToOneSHUpdater : MonoBehaviour
 {
     [Header("References")]
     [Tooltip("Assign EquirectToSH.compute")]
@@ -135,6 +135,7 @@ public class EnvironmentSHUpdaterv1 : MonoBehaviour
         RenderSettings.ambientProbe = sh;
         // 6. Apply to baked light probes in the scene
         ApplyToLightProbes(sh);
+        Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={sh[0,0]:F4} G={sh[1,0]:F4} B={sh[2,0]:F4}");
     }
     // -----------------------------------------------------------------------
     // Helpers
@@ -150,9 +151,13 @@ public class EnvironmentSHUpdaterv1 : MonoBehaviour
         sh.Clear();
         for (int coeff = 0; coeff < 9; coeff++)
         {
-            sh[0, coeff] = raw[coeff * 3 + 0]; // R
-            sh[1, coeff] = raw[coeff * 3 + 1]; // G
-            sh[2, coeff] = raw[coeff * 3 + 2]; // B
+            // sh[0, coeff] = raw[coeff * 3 + 0]; // R
+            // sh[1, coeff] = raw[coeff * 3 + 1]; // G
+            // sh[2, coeff] = raw[coeff * 3 + 2]; // B
+            sh[0, coeff] = 255; // R
+            sh[1, coeff] = 0; // G
+            sh[2, coeff] = 0; // B
+
         }
         return sh;
     }

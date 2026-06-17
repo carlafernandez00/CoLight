@@ -51,7 +51,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         // Create a detached LightProbes clone and make it the active probe set.
         // This must happen before UpdateSH() so all writes go to the owned copy.
-        // InitRuntimeProbes();
+        InitRuntimeProbes();
 
         TryFetchSkyboxTexture();
         if (_currentEnvTex != null)
@@ -243,25 +243,20 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // Apply per-position SH to every baked probe
         if (bakedCount > 0)
         {
+            // Fill the local array (captured before the loop), then write it back
+            // to the detached clone in one shot. Indexing into the array returned
+            // by bakedProbes directly modifies a transient copy — it does not
+            // propagate to the LightProbes object.
             for (int i = 0; i < bakedCount; i++)
-                // bakedProbes[i] = BuildSHL2(_shRaw, i + 1);
-                LightmapSettings.lightProbes.bakedProbes[i] = BuildSHL2(_shRaw, i + 1);
-                
+                bakedProbes[i] = BuildSHL2(_shRaw, i + 1);
+
             // Write to the detached clone — not the asset-backed object.
             // No TetrahedralizeAsync: that call reloads bakedProbes from LightingData.asset,
             // overwriting what we just wrote. Probe positions are unchanged so the existing
             // tetrahedral mesh is valid; only SH values change.
             _runtimeProbes.bakedProbes = bakedProbes;
 
-
-            // Reassign _runtimeProbes to LightmapSettings to flush the updated CPU-side
-            // bakedProbes to the GPU. The bakedProbes setter alone does not mark the GPU
-            // buffer dirty; the LightmapSettings setter does. TetrahedralizeAsync is NOT
-            // called — it holds an internal asset reference that restores the baked SH
-            // values regardless of what LightmapSettings.lightProbes is set to.
-            // LightmapSettings.lightProbes = _runtimeProbes;
-            var verify = _runtimeProbes.bakedProbes;
-            Debug.Log($"[SH] Wrote {bakedCount} probes. Verify readback: probe[0] R={verify[0][0,0]:F4} (wrote {bakedProbes[0][0,0]:F4})");
+            Debug.Log($"[SH] Wrote {bakedCount} probes. probe[0] R={bakedProbes[0][0,0]:F4}");
             _logNextFrame = true;
         }
 
@@ -306,12 +301,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
         int offset = probeIndex * 9 * 3;
         for (int coeff = 0; coeff < 9; coeff++)
         {
-            // sh[0, coeff] = raw[offset + coeff * 3 + 0]; // R
-            // sh[1, coeff] = raw[offset + coeff * 3 + 1]; // G
-            // sh[2, coeff] = raw[offset + coeff * 3 + 2]; // B
-            sh[0, coeff] = 0; // R
-            sh[1, coeff] = 0; // G
-            sh[2, coeff] = 0; // B
+            sh[0, coeff] = raw[offset + coeff * 3 + 0]; // R
+            sh[1, coeff] = raw[offset + coeff * 3 + 1]; // G
+            sh[2, coeff] = raw[offset + coeff * 3 + 2]; // B
         }
         return sh;
     }
