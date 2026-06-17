@@ -24,6 +24,13 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
+    void Awake()
+    {
+        // Disable reflection probes for now
+        QualitySettings.realtimeReflectionProbes = false;
+        RenderSettings.reflectionIntensity = 0f;
+    }
+
     void OnEnable()
     {
         _kernel   = computeShader.FindKernel("ProjectEquirectToSH");
@@ -151,12 +158,12 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         sh.Clear();
         for (int coeff = 0; coeff < 9; coeff++)
         {
-            // sh[0, coeff] = raw[coeff * 3 + 0]; // R
-            // sh[1, coeff] = raw[coeff * 3 + 1]; // G
-            // sh[2, coeff] = raw[coeff * 3 + 2]; // B
-            sh[0, coeff] = 255; // R
-            sh[1, coeff] = 0; // G
-            sh[2, coeff] = 0; // B
+            sh[0, coeff] = raw[coeff * 3 + 0]; // R
+            sh[1, coeff] = raw[coeff * 3 + 1]; // G
+            sh[2, coeff] = raw[coeff * 3 + 2]; // B
+            // sh[0, coeff] = 255; // R
+            // sh[1, coeff] = 0; // G
+            // sh[2, coeff] = 0; // B
 
         }
         return sh;
