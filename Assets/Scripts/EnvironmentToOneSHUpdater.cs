@@ -13,6 +13,8 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
     [Header("Settings")]
     [Tooltip("Update automatically every N frames. 0 = manual only.")]
     public int updateEveryNFrames = 30;
+    [Range(0f, 4f), Tooltip("Scale the computed SH before applying to the ambient probe.")]
+    public float intensityMultiplier = 1f;
     // Internal
     private ComputeBuffer        _shBuffer;
     private float[]              _shRaw;       // 9 × float3 = 27 floats
@@ -139,7 +141,7 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         // 4. Build SphericalHarmonicsL2
         SphericalHarmonicsL2 sh = BuildSHL2(_shRaw);
         // 5. Apply to global ambient probe (affects all dynamic objects)
-        RenderSettings.ambientProbe = sh;
+        RenderSettings.ambientProbe = sh * intensityMultiplier;
         // 6. Apply to baked light probes in the scene
         ApplyToLightProbes(sh);
         Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={sh[0,0]:F4} G={sh[1,0]:F4} B={sh[2,0]:F4}");
