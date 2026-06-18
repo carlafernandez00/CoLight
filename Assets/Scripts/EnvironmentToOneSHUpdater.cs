@@ -15,12 +15,15 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
     public int updateEveryNFrames = 30;
     [Range(0f, 4f), Tooltip("Scale the computed SH before applying to the ambient probe.")]
     public float intensityMultiplier = 1f;
+
     // Internal
     private ComputeBuffer        _shBuffer;
     private float[]              _shRaw;       // 9 × float3 = 27 floats
     private int                  _kernel;
     private int                  _frameCounter;
     private Texture              _currentEnvTex;
+    private LightProbes          _runtimeProbes;
+
     // Known property names used by Unity's Skybox/Panoramic shader
     private static readonly string[] _skyboxTexProperties = { "_MainTex", "_Tex", "_SkyTex" };
     // -----------------------------------------------------------------------
@@ -32,6 +35,7 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         QualitySettings.realtimeReflectionProbes = false;
         RenderSettings.reflectionIntensity = 0f;
 
+        // Custom mode tells Unity to use ambientProbe as-is, without overwriting it from the skybox.
         RenderSettings.ambientMode = AmbientMode.Custom;
     }
 
@@ -40,7 +44,10 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         _kernel   = computeShader.FindKernel("ProjectEquirectToSH");
         _shBuffer = new ComputeBuffer(9, sizeof(float) * 3);
         _shRaw    = new float[27];
-        // First update immediately on enable
+
+        // Create a detached LightProbes instance to allow runtime writes to bakedProbes
+        InitRuntimeProbes();
+
         TryFetchSkyboxTexture();
         if (_currentEnvTex != null)
             UpdateSH();
@@ -59,10 +66,11 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
             _frameCounter = 0;
             // Re-fetch in case the skybox material/texture changed at runtime
             TryFetchSkyboxTexture();
+
             if (_currentEnvTex != null)
                 UpdateSH();
             else
-                Debug.LogWarning("[EnvironmentSHUpdater] No equirect texture found in skybox material.");
+                Debug.LogWarning("[EnvironmentToOneSHUpdater] No equirect texture found in skybox material.");
         }
     }
     // -----------------------------------------------------------------------
@@ -79,7 +87,7 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
             TryFetchSkyboxTexture();
             if (_currentEnvTex == null)
             {
-                Debug.LogWarning("[EnvironmentSHUpdater] Cannot update SH: no texture available.");
+                Debug.LogWarning("[EnvironmentToOneSHUpdater] Cannot update SH: no texture available.");
                 return;
             }
         }
@@ -102,7 +110,7 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         Material skyMat = RenderSettings.skybox;
         if (skyMat == null)
         {
-            Debug.LogWarning("[EnvironmentSHUpdater] RenderSettings.skybox is null.");
+            Debug.LogWarning("[EnvironmentToOneSHUpdater] RenderSettings.skybox is null.");
             _currentEnvTex = null;
             return;
         }
@@ -120,7 +128,7 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
             }
         }
         // Fallback: log all texture properties to help debug unknown shaders
-        Debug.LogWarning($"[EnvironmentSHUpdater] Could not find texture in skybox material '{skyMat.name}'. " +
+        Debug.LogWarning($"[EnvironmentToOneSHUpdater] Could not find texture in skybox material '{skyMat.name}'. " +
                          $"Shader: '{skyMat.shader.name}'. " +
                          $"Try adding the property name to _skyboxTexProperties.");
         _currentEnvTex = null;
@@ -146,8 +154,10 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         RenderSettings.ambientProbe = sh * intensityMultiplier;
         // 6. Apply to baked light probes in the scene
         ApplyToLightProbes(sh);
-        Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={sh[0,0]:F4} G={sh[1,0]:F4} B={sh[2,0]:F4}");
+        Debug.Log($"[EnvironmentToOneSHUpdater] SH updated — Band0 R={sh[0,0]:F4} G={sh[1,0]:F4} B={sh[2,0]:F4}");
     }
+
+    
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -168,25 +178,37 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
             // sh[0, coeff] = 255; // R
             // sh[1, coeff] = 0; // G
             // sh[2, coeff] = 0; // B
-
         }
         return sh;
     }
-    /// <summary>
-    /// Writes the same SH to every probe in the scene.
-    /// Since CoLight estimates a single global environment, one SH for all probes is correct.
-    /// </summary>
-    private static void ApplyToLightProbes(SphericalHarmonicsL2 sh)
-    {
-        LightProbes probes = LightmapSettings.lightProbes;
-        if (probes == null || probes.count == 0)
+    private void InitRuntimeProbes()
+    {  
+        // Try to get the detached LightProbes instance for this scene, or fallback to the default asset.
+        LightProbes source = LightProbes.GetInstantiatedLightProbesForScene(gameObject.scene)
+                             ?? LightmapSettings.lightProbes;
+
+        if (source == null)
         {
-            // No baked probes in scene — ambientProbe alone is sufficient
+            Debug.LogWarning("[EnvironmentToOneSHUpdater] No LightProbes in scene — baked probe illumination will not update.");
             return;
         }
-        SphericalHarmonicsL2[] bakedProbes = probes.bakedProbes;
-        for (int i = 0; i < bakedProbes.Length; i++)
-            bakedProbes[i] = sh;
-        probes.bakedProbes = bakedProbes; // write back triggers GPU upload
+
+        _runtimeProbes = Object.Instantiate(source); // Detached copy to allow runtime writes to bakedProbes
+        
+        var baked = _runtimeProbes.bakedProbes;
+        for (int i = 0; i < baked.Length; i++) baked[i] = new SphericalHarmonicsL2();
+        _runtimeProbes.bakedProbes = baked;
+
+        LightmapSettings.lightProbes = _runtimeProbes;
+    }
+
+    private void ApplyToLightProbes(SphericalHarmonicsL2 sh)
+    {
+        if (_runtimeProbes == null || _runtimeProbes.count == 0) return;
+        var baked = _runtimeProbes.bakedProbes;
+        var scaled = sh * intensityMultiplier;
+        
+        for (int i = 0; i < baked.Length; i++) baked[i] = scaled;
+        _runtimeProbes.bakedProbes = baked;
     }
 }
