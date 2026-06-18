@@ -23,6 +23,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
              "produce a visible parallax effect. Typical indoor range: 5–20.")]
     public float envSphereRadius = 10f;
 
+    [Range(0f, 4f), Tooltip("Scale the computed SH before applying to the ambient probe.")]
+    public float intensityMultiplier = 1f;
+
     // Internal
     private ComputeBuffer _shBuffer;
     private float[]       _shRaw;
@@ -43,6 +46,15 @@ public class EnvironmentSHUpdater : MonoBehaviour
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
+
+    void Awake()
+    {
+        // Disable reflection probes for now
+        QualitySettings.realtimeReflectionProbes = false;
+        RenderSettings.reflectionIntensity = 0f;
+        
+        RenderSettings.ambientMode = AmbientMode.Custom;
+    }
 
     void OnEnable()
     {
@@ -235,10 +247,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // Read back all SH data in one call
         _shBuffer.GetData(_shRaw);
 
-        // Custom mode tells Unity to use ambientProbe as-is, without overwriting it from the skybox.
+        // Apply to global ambient probe (affects all dynamic objects)
         var ambientSH = BuildSHL2(_shRaw, 0);
-        RenderSettings.ambientMode  = AmbientMode.Custom;
-        RenderSettings.ambientProbe = ambientSH;
+        RenderSettings.ambientProbe = ambientSH * intensityMultiplier;
 
         // Apply per-position SH to every baked probe
         if (bakedCount > 0)
@@ -304,6 +315,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
             sh[0, coeff] = raw[offset + coeff * 3 + 0]; // R
             sh[1, coeff] = raw[offset + coeff * 3 + 1]; // G
             sh[2, coeff] = raw[offset + coeff * 3 + 2]; // B
+
+            // sh[0, coeff] = 0; // R
+            // sh[1, coeff] = 0; // G
+            // sh[2, coeff] = 0; // B
         }
         return sh;
     }
