@@ -32,13 +32,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _kernel;
     private int           _frameCounter;
     private Texture       _currentEnvTex;
-    private bool          _logNextFrame;
-
-    // Detached (non-asset-backed) LightProbes clone owned by this script.
-    // LightmapSettings.lightProbes returns the LightingData.asset native object
-    // whose bakedProbes setter silently rejects runtime writes. Object.Instantiate
-    // produces an independent copy that accepts them.
-    private LightProbes _runtimeProbes;
+    private LightProbes   _runtimeProbes;  
 
     // Known property names used by Unity's Skybox/Panoramic shader
     private static readonly string[] _skyboxTexProperties = { "_MainTex", "_Tex", "_SkyTex" };
@@ -53,6 +47,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         QualitySettings.realtimeReflectionProbes = false;
         RenderSettings.reflectionIntensity = 0f;
         
+        // Custom mode tells Unity to use ambientProbe as-is, without overwriting it from the skybox.
         RenderSettings.ambientMode = AmbientMode.Custom;
     }
 
@@ -78,15 +73,6 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
     void Update()
     {
-        if (_logNextFrame)
-        {
-            _logNextFrame = false;
-            float val = (_runtimeProbes != null && _runtimeProbes.bakedProbes.Length > 0)
-                        ? _runtimeProbes.bakedProbes[0][0, 0]
-                        : float.NaN;
-            Debug.Log($"[SH] Next-frame check: probe[0] R={val:F4} (should match written value)");
-        }
-
         if (updateEveryNFrames <= 0) return;
         _frameCounter++;
         if (_frameCounter >= updateEveryNFrames)
@@ -177,29 +163,23 @@ public class EnvironmentSHUpdater : MonoBehaviour
     // writes target this owned object, bypassing Unity's asset-backed guard.
     private void InitRuntimeProbes()
     {
+        // Try to get the detached LightProbes instance for this scene, or fallback to the default asset.
         LightProbes source = LightProbes.GetInstantiatedLightProbesForScene(gameObject.scene)
                              ?? LightmapSettings.lightProbes;
 
         if (source == null)
         {
-            Debug.LogWarning("[EnvironmentSHUpdater] No LightProbes found in scene — baked probe illumination will not update.");
+            Debug.LogWarning("[EnvironmentSHUpdater] No LightProbes in scene — baked probe illumination will not update.");
             return;
         }
 
-        _runtimeProbes = Object.Instantiate(source);
+        _runtimeProbes = Object.Instantiate(source); // Detached copy to allow runtime writes to bakedProbes
 
-        // Zero out baked SH so disk-baked values don't flash until the first UpdateSH completes.
         var baked = _runtimeProbes.bakedProbes;
-        if (baked != null && baked.Length > 0)
-        {
-            for (int i = 0; i < baked.Length; i++) baked[i] = new SphericalHarmonicsL2();
-            _runtimeProbes.bakedProbes = baked;
-        }
+        for (int i = 0; i < baked.Length; i++) baked[i] = new SphericalHarmonicsL2();
+        _runtimeProbes.bakedProbes = baked;
 
         LightmapSettings.lightProbes = _runtimeProbes;
-
-        Debug.Log($"[SH] Runtime probes ready: {_runtimeProbes.positions.Length} positions, " +
-                  $"{_runtimeProbes.bakedProbes.Length} SH slots, instanceID={_runtimeProbes.GetInstanceID()}");
     }
 
     // -----------------------------------------------------------------------
@@ -214,23 +194,23 @@ public class EnvironmentSHUpdater : MonoBehaviour
             yield break;
         }
 
-        Debug.Log($"[SH] tex={_currentEnvTex != null} ({_currentEnvTex?.name})");
-
+        // Get baked probes and positions 
         SphericalHarmonicsL2[] bakedProbes = _runtimeProbes.bakedProbes;
         Vector3[]              positions   = _runtimeProbes.positions;
         int bakedCount = bakedProbes != null ? bakedProbes.Length : 0;
-        Debug.Log($"[SH] bakedCount={bakedCount}, positions={positions?.Length}");
 
-        // Slot 0 = ambient probe, slots 1..N = baked light probes
+        // Ensure we have enough space in our buffers 
+        // bakedCount + 1 : slot 0 reserved for ambient probe
         EnsureBuffer(bakedCount + 1);
 
-        // Bind inputs that are the same for every dispatch
+        // 1. Dispatch compute shader for each probe (ambient + baked)
         computeShader.SetTexture(_kernel, "_EquirectMap",    _currentEnvTex);
         computeShader.SetBuffer (_kernel, "_SHCoeffs",       _shBuffer);
         computeShader.SetInt    ("_TexWidth",                _currentEnvTex.width);
         computeShader.SetInt    ("_TexHeight",               _currentEnvTex.height);
         computeShader.SetFloat  ("_EnvSphereRadius",         envSphereRadius);
 
+        // 2. Dispatch probes and set their world-space positions for parallax correction
         // Dispatch for ambient probe (slot 0) — always computed from world origin
         DispatchForProbe(0, Vector3.zero);
 
@@ -241,37 +221,26 @@ public class EnvironmentSHUpdater : MonoBehaviour
             DispatchForProbe(i + 1, pos);
         }
 
-        // Wait one frame — all dispatches are queued and GPU finishes before readback
+        // 3. Wait one frame for GPU work to complete
         yield return null;
 
-        // Read back all SH data in one call
+        // 4. Readback all SH data GPU → CPU
         _shBuffer.GetData(_shRaw);
 
+        // 5. Build SphericalHarmonicsL2 and apply to ambient probe
         // Apply to global ambient probe (affects all dynamic objects)
         var ambientSH = BuildSHL2(_shRaw, 0);
         RenderSettings.ambientProbe = ambientSH * intensityMultiplier;
 
-        // Apply per-position SH to every baked probe
+        // 6. Build SphericalHarmonicsL2 and apply to baked probes
         if (bakedCount > 0)
         {
-            // Fill the local array (captured before the loop), then write it back
-            // to the detached clone in one shot. Indexing into the array returned
-            // by bakedProbes directly modifies a transient copy — it does not
-            // propagate to the LightProbes object.
             for (int i = 0; i < bakedCount; i++)
-                bakedProbes[i] = BuildSHL2(_shRaw, i + 1);
-
-            // Write to the detached clone — not the asset-backed object.
-            // No TetrahedralizeAsync: that call reloads bakedProbes from LightingData.asset,
-            // overwriting what we just wrote. Probe positions are unchanged so the existing
-            // tetrahedral mesh is valid; only SH values change.
+                bakedProbes[i] = BuildSHL2(_shRaw, i + 1) * intensityMultiplier;
             _runtimeProbes.bakedProbes = bakedProbes;
-
-            Debug.Log($"[SH] Wrote {bakedCount} probes. probe[0] R={bakedProbes[0][0,0]:F4}");
-            _logNextFrame = true;
         }
 
-        Debug.Log($"[SH] Band0 R={ambientSH[0,0]:F4} G={ambientSH[1,0]:F4} B={ambientSH[2,0]:F4} | {bakedCount} baked probe(s) updated");
+        Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={ambientSH[0,0]:F4} G={ambientSH[1,0]:F4} B={ambientSH[2,0]:F4} | {bakedCount} baked probe(s)");
     }
 
     private void DispatchForProbe(int probeIndex, Vector3 position)
@@ -291,10 +260,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
     {
         int elementCount = probeCount * 9;
         if (_shBuffer != null && _shBuffer.count == elementCount) return;
+
         _shBuffer?.Release();
         _shBuffer = new ComputeBuffer(elementCount, sizeof(float) * 3);
         _shRaw    = new float[elementCount * 3]; // elementCount float3s → elementCount*3 floats
     }
+
 
     // -----------------------------------------------------------------------
     // Helpers
