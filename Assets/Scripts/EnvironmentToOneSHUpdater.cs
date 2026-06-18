@@ -31,6 +31,8 @@ public class EnvironmentToOneSHUpdater : MonoBehaviour
         // Disable reflection probes for now
         QualitySettings.realtimeReflectionProbes = false;
         RenderSettings.reflectionIntensity = 0f;
+
+        RenderSettings.ambientMode = AmbientMode.Custom;
     }
 
     void OnEnable()
