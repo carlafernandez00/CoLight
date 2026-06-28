@@ -81,6 +81,7 @@ void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
     float totalWeight = 0.0f;
     float R = _EnvSphereRadius;
 
+    // TODO: No anar per tots els textels -> importance sampling 
     for (int y = 0; y < _TexHeight; y++)
     {
         for (int x = 0; x < _TexWidth; x++)
