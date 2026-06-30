@@ -1,6 +1,9 @@
 using System.Collections;
+using System.Diagnostics;
+using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
+using Debug = UnityEngine.Debug;
 
 /// <summary>
 /// Projects the scene's Skybox/Panoramic environment map to L2 Spherical Harmonics
@@ -37,6 +40,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
     // Known property names used by Unity's Skybox/Panoramic shader
     private static readonly string[] _skyboxTexProperties = { "_MainTex", "_Tex", "_SkyTex" };
 
+    // Profiling: Stopwatches for measuring GPU dispatch, readback, and total time
+    private readonly Stopwatch _swTotal    = new Stopwatch();  // Total time for the entire UpdateSH() process
+    private readonly Stopwatch _swDispatch = new Stopwatch();  // Time spent dispatching the compute shader for all probes
+    private readonly Stopwatch _swReadback = new Stopwatch();  // Time spent reading back the results
+    private string _profileLogPath;
+
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
@@ -55,6 +64,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
     {
         _kernel = computeShader.FindKernel("ProjectEquirectToSH");
         EnsureBuffer(1); // at minimum one slot for the ambient probe
+
+        // Profiling log setup
+        _profileLogPath = Path.Combine(Application.dataPath, "Debug", "SHProfiler.csv");
+        Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
+        File.WriteAllText(_profileLogPath, "frame,probeCount,dispatch_s,readback_s,total_s\n");
+        Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
 
         // Create a detached LightProbes clone and make it the active probe set.
         // This must happen before UpdateSH() so all writes go to the owned copy.
@@ -203,6 +218,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // bakedCount + 1 : slot 0 reserved for ambient probe
         EnsureBuffer(bakedCount + 1);
 
+        _swTotal.Restart();
+
         // 1. Dispatch compute shader for each probe (ambient + baked)
         computeShader.SetTexture(_kernel, "_EquirectMap",    _currentEnvTex);
         computeShader.SetBuffer (_kernel, "_SHCoeffs",       _shBuffer);
@@ -212,6 +229,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         // 2. Dispatch probes and set their world-space positions for parallax correction
         // Dispatch for ambient probe (slot 0) — always computed from world origin
+        _swDispatch.Restart();
         DispatchForProbe(0, Vector3.zero);
 
         // Dispatch once per baked probe; fall back to origin if positions are unavailable
@@ -220,15 +238,22 @@ public class EnvironmentSHUpdater : MonoBehaviour
             Vector3 pos = (positions != null && i < positions.Length) ? positions[i] : Vector3.zero;
             DispatchForProbe(i + 1, pos);
         }
+        _swDispatch.Stop();
+
+        _swTotal.Stop();
 
         // 3. Wait one frame for GPU work to complete
         yield return null;
 
+        _swTotal.Start();
+
         // 4. Readback all SH data GPU → CPU
+        _swReadback.Restart();
         _shBuffer.GetData(_shRaw);
+        _swReadback.Stop();
 
         // 5. Build SphericalHarmonicsL2 and apply to ambient probe
-        // Apply to global ambient probe (affects all dynamic objects)
+        // Apply to global ambient probe (affects all dynamic objects) 
         var ambientSH = BuildSHL2(_shRaw, 0);
         RenderSettings.ambientProbe = ambientSH * intensityMultiplier;
 
@@ -240,7 +265,18 @@ public class EnvironmentSHUpdater : MonoBehaviour
             _runtimeProbes.bakedProbes = bakedProbes;
         }
 
-        Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={ambientSH[0,0]:F4} G={ambientSH[1,0]:F4} B={ambientSH[2,0]:F4} | {bakedCount} baked probe(s)");
+        _swTotal.Stop();
+
+        // 7. Log profiling results
+        double dispatchS = _swDispatch.Elapsed.TotalSeconds;
+        double readbackS = _swReadback.Elapsed.TotalSeconds;
+        double totalS    = _swTotal.Elapsed.TotalSeconds;
+
+        Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
+                  $"dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
+
+        File.AppendAllText(_profileLogPath,
+            $"{Time.frameCount},{bakedCount + 1},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
     }
 
     private void DispatchForProbe(int probeIndex, Vector3 position)
