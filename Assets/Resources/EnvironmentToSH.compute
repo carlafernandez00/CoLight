@@ -55,38 +55,33 @@ float SH_Y2p1(float3 d)  { return 1.092548f * d.x * d.z; }                      
 float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }          // √(15/16π) · (x²-y²)
 
 #define PI 3.14159265f
+#define NUM_THREADS 64
 
 // ---------------------------------------------------------------------------
-// Unity's SphericalHarmonicsL2 / SampleSH9 stores irradiance SH and performs
-// a plain polynomial eval with no convolution at render time, so the factors
-// must be pre-baked here:
-//   Band 0: A0 = π       Band 1: A1 = 2π/3     Band 2: A2 = π/4
+// Groupshared memory: each thread accumulates into its own slot (no atomics).
+// - Threads accumulate independently — no conflict, no atomics
+// - Then a halving reduction folds 64 slots into slot [0]
 // ---------------------------------------------------------------------------
 
-// TODO: For better performance with larger environment maps, we could parallelize this by dispatching multiple threads and using atomic adds to accumulate into the SH coefficients. However, for typical skybox resolutions (e.g., 1024×512), a single thread is sufficient and simpler to implement.
-// EXAMPLE:
-// [numthreads(8, 8, 1)]
-// each thread handles one pixel, accumulates into groupshared float3 sh[9]
-// then do a group reduction before writing to _SHCoeffs with InterlockedAdd
-[numthreads(1, 1, 1)]
-void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
+groupshared float3 gSH[NUM_THREADS][9];   // partial SH per thread 
+groupshared float  gWeight[NUM_THREADS];  // partial solid-angle weight per thread 
+
+[numthreads(NUM_THREADS, 1, 1)]
+void ProjectEquirectToSH(uint3 groupID : SV_GroupID, uint threadIndex : SV_GroupThreadID)
 {
-    // Only one thread does the work
-    if (id.x != 0 || id.y != 0) return;
-
-    // List with the 9 SH coefficients (RGB each)
-    float3 sh[9];
-    [unroll] for (int k = 0; k < 9; k++) sh[k] = float3(0, 0, 0);
+    // Init this thread's groupshared slots with the 9 SH coefficients (RGB each)
+    [unroll] for (int k = 0; k < 9; k++) gSH[threadIndex][k] = float3(0, 0, 0);
 
     // Total solid angle weight for normalization
-    float totalWeight = 0.0f;
+    gWeight[threadIndex] = 0.0f;
     float R = _EnvSphereRadius;
 
     // Mip-level loop bounds: each mip halves the resolution (>> is a bitwise right shift)
     int mipW = max(1, _TexWidth  >> _MipLevel);
     int mipH = max(1, _TexHeight >> _MipLevel);
 
-    for (int y = 0; y < mipH; y++)
+    // Each thread processes a strided subset (stride = NUM_THREADS) of pixels in the mip level
+    for (int y = (int)threadIndex; y < mipH; y += NUM_THREADS)
     {
         for (int x = 0; x < mipW; x++)
         {
@@ -107,12 +102,12 @@ void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
             float sinTheta = sin(theta);
             float3 dir = float3(
                 sinTheta * sin(phi),    // x
-                cos(theta),             // y  (up)
+                cos(theta),             // y (up)
                 sinTheta * cos(phi)     // z
             );
 
             // --- Step 4: base differential solid angle (equirectangular correction) ---
-            // dΩ = sin(θ) · dθ · dφ
+            // Base solid angle: dΩ = sin(θ) · dθ · dφ
             // sin(θ) corrects for equirectangular distortion:
             //   poles   (θ→0 or π): sin(θ)→0, low weight
             //   equator (θ = π/2):  sin(θ)=1, full weight
@@ -140,40 +135,57 @@ void ProjectEquirectToSH(uint3 id : SV_DispatchThreadID)
             // --- Step 7: accumulate SH projection ---
             // Use dirProbe (probe-relative direction) for basis functions,
             // dOmegaProbe (parallax-corrected solid angle) as weight.
-            sh[0] += color * SH_Y00()           * dOmegaProbe;
-            sh[1] += color * SH_Y1n1(dirProbe)  * dOmegaProbe;
-            sh[2] += color * SH_Y10 (dirProbe)  * dOmegaProbe;
-            sh[3] += color * SH_Y1p1(dirProbe)  * dOmegaProbe;
-            sh[4] += color * SH_Y2n2(dirProbe)  * dOmegaProbe;
-            sh[5] += color * SH_Y2n1(dirProbe)  * dOmegaProbe;
-            sh[6] += color * SH_Y20 (dirProbe)  * dOmegaProbe;
-            sh[7] += color * SH_Y2p1(dirProbe)  * dOmegaProbe;
-            sh[8] += color * SH_Y2p2(dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][0] += color * SH_Y00()           * dOmegaProbe;
+            gSH[threadIndex][1] += color * SH_Y1n1(dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][2] += color * SH_Y10 (dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][3] += color * SH_Y1p1(dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][4] += color * SH_Y2n2(dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][5] += color * SH_Y2n1(dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][6] += color * SH_Y20 (dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][7] += color * SH_Y2p1(dirProbe)  * dOmegaProbe;
+            gSH[threadIndex][8] += color * SH_Y2p2(dirProbe)  * dOmegaProbe;
 
-            totalWeight += dOmegaProbe;
+            gWeight[threadIndex] += dOmegaProbe;
         }
     }
 
-    // --- Step 8: normalize to 4π (total solid angle of a sphere) ---
-    // Corrects for numerical drift in the discrete sum.
-    float normFactor = (4.0f * PI) / totalWeight;
-    [unroll] for (int j = 0; j < 9; j++)
-        sh[j] *= normFactor;
+    // --- Step 8: Halving reduction: merge 64 partial sums into slot [0] ---                                                                        
+    // Each step halves the active set; barrier ensures prior writes are visible. 
+    GroupMemoryBarrierWithGroupSync();
 
-    // --- Step 9: Lambertian (ZH) convolution — radiance → irradiance SH ---
+    [unroll] for (uint stride = NUM_THREADS / 2; stride > 0; stride >>= 1) 
+    {
+        if (threadIndex < stride)
+        {
+            [unroll] for (int c = 0; c < 9; c++) gSH[threadIndex][c] += gSH[threadIndex + stride][c];
+            gWeight[threadIndex] += gWeight[threadIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Only thread 0 holds the final accumulated result — all others exit
+    if (threadIndex != 0) return;
+
+    // --- Step 9: normalize to 4π (total solid angle of a sphere) ---
+    // Corrects for numerical drift in the discrete sum.
+    float normFactor = (4.0f * PI) / gWeight[0];
+    [unroll] for (int j = 0; j < 9; j++)
+        gSH[0][j] *= normFactor;
+
+    // --- Step 10: Lambertian (ZH) convolution — radiance → irradiance SH ---
     // Ramamoorthi & Hanrahan 2001 factors, required because Unity's SampleSH9
     // performs a plain polynomial eval with no runtime convolution.
-    // sh[0] *= PI;
-    // sh[1] *= (2.0f * PI / 3.0f);
-    // sh[2] *= (2.0f * PI / 3.0f);
-    // sh[3] *= (2.0f * PI / 3.0f);
-    // sh[4] *= (PI / 4.0f);
-    // sh[5] *= (PI / 4.0f);
-    // sh[6] *= (PI / 4.0f);
-    // sh[7] *= (PI / 4.0f);
-    // sh[8] *= (PI / 4.0f);
+    // gSH[0][0] *= PI;
+    // gSH[0][1] *= (2.0f * PI / 3.0f);
+    // gSH[0][2] *= (2.0f * PI / 3.0f);
+    // gSH[0][3] *= (2.0f * PI / 3.0f);
+    // gSH[0][4] *= (PI / 4.0f);
+    // gSH[0][5] *= (PI / 4.0f);
+    // gSH[0][6] *= (PI / 4.0f);
+    // gSH[0][7] *= (PI / 4.0f);
+    // gSH[0][8] *= (PI / 4.0f);
 
-    // --- Step 10: write coefficients to output buffer ---
+    // --- Step 11: write coefficients to output buffer ---
     int base = _ProbeIndex * 9;
-    [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[base + i] = sh[i];
+    [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[base + i] = gSH[0][i];
 }
