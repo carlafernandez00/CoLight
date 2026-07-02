@@ -29,6 +29,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Range(0f, 4f), Tooltip("Scale the computed SH before applying to the ambient probe.")]
     public float intensityMultiplier = 1f;
 
+    [Range(0, 6), Tooltip("Mip level of the environment texture to sample. 0 = full res, 1 = half, 2 = quarter, etc.")]
+    public int mipLevel = 0;
+
     // Internal
     private ComputeBuffer _shBuffer;
     private float[]       _shRaw;
@@ -226,6 +229,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetInt    ("_TexWidth",                _currentEnvTex.width);
         computeShader.SetInt    ("_TexHeight",               _currentEnvTex.height);
         computeShader.SetFloat  ("_EnvSphereRadius",         envSphereRadius);
+        computeShader.SetInt    ("_MipLevel",                mipLevel);
 
         // 2. Dispatch probes and set their world-space positions for parallax correction
         // Dispatch for ambient probe (slot 0) — always computed from world origin
