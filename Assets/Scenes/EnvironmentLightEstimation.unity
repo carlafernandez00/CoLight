@@ -320,6 +320,7 @@ MonoBehaviour:
   updateEveryNFrames: 30
   envSphereRadius: 10
   intensityMultiplier: 1
+  mipLevel: 2
 --- !u!1 &317906632
 GameObject:
   m_ObjectHideFlags: 0
