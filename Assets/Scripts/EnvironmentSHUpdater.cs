@@ -221,7 +221,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // bakedCount + 1 : slot 0 reserved for ambient probe
         EnsureBuffer(bakedCount + 1);
 
-        _swTotal.Restart();
+        _swTotal.Restart(); // reset + start
 
         // 1. Dispatch compute shader for each probe (ambient + baked)
         computeShader.SetTexture(_kernel, "_EquirectMap",    _currentEnvTex);
@@ -244,12 +244,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
         }
         _swDispatch.Stop();
 
-        _swTotal.Stop();
+        // _swTotal.Stop();
 
         // 3. Wait one frame for GPU work to complete
-        yield return null;
+        // yield return null;
 
-        _swTotal.Start();
+        // _swTotal.Start();
 
         // 4. Readback all SH data GPU → CPU
         _swReadback.Restart();
