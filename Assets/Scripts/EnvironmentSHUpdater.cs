@@ -38,7 +38,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _kernel;
     private int           _frameCounter;
     private Texture       _currentEnvTex;
-    private LightProbes   _runtimeProbes;  
+    private LightProbes   _runtimeProbes;
 
     // Known property names used by Unity's Skybox/Panoramic shader
     private static readonly string[] _skyboxTexProperties = { "_MainTex", "_Tex", "_SkyTex" };
@@ -244,12 +244,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
         }
         _swDispatch.Stop();
 
-        // _swTotal.Stop();
+        _swTotal.Stop();
 
         // 3. Wait one frame for GPU work to complete
-        // yield return null;
+        yield return null;
 
-        // _swTotal.Start();
+        _swTotal.Start();
 
         // 4. Readback all SH data GPU → CPU
         _swReadback.Restart();
