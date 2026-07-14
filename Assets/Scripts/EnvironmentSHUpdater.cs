@@ -32,13 +32,36 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Range(0, 6), Tooltip("Mip level of the environment texture to sample. 0 = full res, 1 = half, 2 = quarter, etc.")]
     public int mipLevel = 0;
 
+    public enum ProjectionMethod
+    {
+        FullScan,            // Deterministic quadrature over every texel (flicker-free, cost scales with resolution)
+        ImportanceSampling   // Monte Carlo sampling of a luminance distribution (cost fixed by sample count)
+    }
+
+    [Header("Projection method")]
+    [Tooltip("FullScan visits every texel. ImportanceSampling draws numSamples from a luminance-weighted distribution.")]
+    public ProjectionMethod method = ProjectionMethod.FullScan;
+
+    [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
+    public int numSamples = 2048;
+
     // Internal
     private ComputeBuffer _shBuffer;
     private float[]       _shRaw;
-    private int           _kernel;
+    private int           _kernelFull;
+    private int           _kernelIS;
+    private int           _kernelBuildCond;
+    private int           _kernelBuildMarg;
+    private int           _activeKernel;
     private int           _frameCounter;
     private Texture       _currentEnvTex;
     private LightProbes   _runtimeProbes;
+
+    // Luminance distribution buffers (importance sampling), sized to the mip dims
+    private ComputeBuffer _condCdfBuffer;      // mipH * (mipW + 1) floats
+    private ComputeBuffer _marginalCdfBuffer;  // mipH + 1 floats
+    private ComputeBuffer _marginalFuncBuffer; // mipH floats
+    private int           _distW, _distH;      // dims the distribution buffers were built for
 
     // Known property names used by Unity's Skybox/Panoramic shader
     private static readonly string[] _skyboxTexProperties = { "_MainTex", "_Tex", "_SkyTex" };
@@ -47,6 +70,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private readonly Stopwatch _swTotal    = new Stopwatch();  // Total time for the entire UpdateSH() process
     private readonly Stopwatch _swDispatch = new Stopwatch();  // Time spent dispatching the compute shader for all probes
     private readonly Stopwatch _swReadback = new Stopwatch();  // Time spent reading back the results
+    private readonly Stopwatch _swBuild    = new Stopwatch();  // Time spent building the luminance distribution (Importance Sampling only)
     private string _profileLogPath;
 
     // -----------------------------------------------------------------------
@@ -65,13 +89,16 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
     void OnEnable()
     {
-        _kernel = computeShader.FindKernel("ProjectEquirectToSH");
+        _kernelFull      = computeShader.FindKernel("ProjectEquirectToSH");
+        _kernelIS        = computeShader.FindKernel("ProjectEquirectToSH_IS");
+        _kernelBuildCond = computeShader.FindKernel("BuildConditionalCDF");
+        _kernelBuildMarg = computeShader.FindKernel("BuildMarginalCDF");
         EnsureBuffer(1); // at minimum one slot for the ambient probe
 
         // Profiling log setup
         _profileLogPath = Path.Combine(Application.dataPath, "Debug", "SHProfiler.csv");
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
-        File.WriteAllText(_profileLogPath, "frame,probeCount,dispatch_s,readback_s,total_s\n");
+        File.WriteAllText(_profileLogPath, "frame,method,probeCount,samples,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
 
         // Create a detached LightProbes clone and make it the active probe set.
@@ -87,6 +114,11 @@ public class EnvironmentSHUpdater : MonoBehaviour
     {
         _shBuffer?.Release();
         _shBuffer = null;
+
+        _condCdfBuffer?.Release();      _condCdfBuffer      = null;
+        _marginalCdfBuffer?.Release();  _marginalCdfBuffer  = null;
+        _marginalFuncBuffer?.Release(); _marginalFuncBuffer = null;
+        _distW = _distH = 0;
     }
 
     void Update()
@@ -223,13 +255,37 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         _swTotal.Restart(); // reset + start
 
-        // 1. Dispatch compute shader for each probe (ambient + baked)
-        computeShader.SetTexture(_kernel, "_EquirectMap",    _currentEnvTex);
-        computeShader.SetBuffer (_kernel, "_SHCoeffs",       _shBuffer);
-        computeShader.SetInt    ("_TexWidth",                _currentEnvTex.width);
-        computeShader.SetInt    ("_TexHeight",               _currentEnvTex.height);
-        computeShader.SetFloat  ("_EnvSphereRadius",         envSphereRadius);
-        computeShader.SetInt    ("_MipLevel",                mipLevel);
+        // Select the kernel for this update
+        _activeKernel = (method == ProjectionMethod.ImportanceSampling) ? _kernelIS : _kernelFull;
+
+        // 1. Global constants (SetInt/SetFloat are shared across all kernels)
+        computeShader.SetInt   ("_TexWidth",        _currentEnvTex.width);
+        computeShader.SetInt   ("_TexHeight",       _currentEnvTex.height);
+        computeShader.SetFloat ("_EnvSphereRadius", envSphereRadius);
+        computeShader.SetInt   ("_MipLevel",        mipLevel);
+        computeShader.SetInt   ("_NumSamples",      numSamples);
+
+        // 1a. Importance sampling: build the luminance distribution ONCE.
+        //     It depends only on the env map, so all probes reuse it.
+        _swBuild.Reset();
+        if (method == ProjectionMethod.ImportanceSampling)
+        {
+            int mipW = Mathf.Max(1, _currentEnvTex.width  >> mipLevel);
+            int mipH = Mathf.Max(1, _currentEnvTex.height >> mipLevel);
+            EnsureDistributionBuffers(mipW, mipH);
+
+            _swBuild.Start();
+            BuildLuminanceDistribution(mipW, mipH);
+            _swBuild.Stop();
+
+            // Bind the distribution buffers to the sampling kernel
+            computeShader.SetBuffer(_kernelIS, "_CondCdf",     _condCdfBuffer);
+            computeShader.SetBuffer(_kernelIS, "_MarginalCdf", _marginalCdfBuffer);
+        }
+
+        // 1b. Bind common resources to the active kernel
+        computeShader.SetTexture(_activeKernel, "_EquirectMap", _currentEnvTex);
+        computeShader.SetBuffer (_activeKernel, "_SHCoeffs",    _shBuffer);
 
         // 2. Dispatch probes and set their world-space positions for parallax correction
         // Dispatch for ambient probe (slot 0) — always computed from world origin
@@ -272,22 +328,59 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _swTotal.Stop();
 
         // 7. Log profiling results
+        double buildS    = _swBuild.Elapsed.TotalSeconds;
         double dispatchS = _swDispatch.Elapsed.TotalSeconds;
         double readbackS = _swReadback.Elapsed.TotalSeconds;
         double totalS    = _swTotal.Elapsed.TotalSeconds;
+        int    samples   = (method == ProjectionMethod.ImportanceSampling) ? numSamples : 0;
 
-        Debug.Log($"[EnvironmentSHUpdater] SH updated — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
-                  $"dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
+        Debug.Log($"[EnvironmentSHUpdater] SH updated ({method}) — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
+                  $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
 
         File.AppendAllText(_profileLogPath,
-            $"{Time.frameCount},{bakedCount + 1},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
+            $"{Time.frameCount},{method},{bakedCount + 1},{samples},{buildS:F6},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
     }
 
     private void DispatchForProbe(int probeIndex, Vector3 position)
     {
         computeShader.SetVector("_ProbePosition", position);
         computeShader.SetInt   ("_ProbeIndex",    probeIndex);
-        computeShader.Dispatch (_kernel, 1, 1, 1);
+        computeShader.Dispatch (_activeKernel, 1, 1, 1);
+    }
+
+    // Builds the PBRT-style Distribution2D (luminance × sinθ) for the current
+    // env map at the active mip level. Two passes: per-row conditional CDFs
+    // (one thread per row), then the marginal CDF (single thread). Shared by
+    // every probe in this update.
+    private void BuildLuminanceDistribution(int mipW, int mipH)
+    {
+        // Pass 1 — conditional CDF along u, one thread per row
+        computeShader.SetTexture(_kernelBuildCond, "_EquirectMap",  _currentEnvTex);
+        computeShader.SetBuffer (_kernelBuildCond, "_CondCdf",      _condCdfBuffer);
+        computeShader.SetBuffer (_kernelBuildCond, "_MarginalFunc", _marginalFuncBuffer);
+        int groups = Mathf.CeilToInt(mipH / 64f); // kernel uses [numthreads(64,1,1)]
+        computeShader.Dispatch(_kernelBuildCond, groups, 1, 1);
+
+        // Pass 2 — marginal CDF along v, single thread
+        computeShader.SetBuffer(_kernelBuildMarg, "_MarginalFunc", _marginalFuncBuffer);
+        computeShader.SetBuffer(_kernelBuildMarg, "_MarginalCdf",  _marginalCdfBuffer);
+        computeShader.Dispatch(_kernelBuildMarg, 1, 1, 1);
+    }
+
+    // Recreates the distribution buffers only when the mip dimensions change.
+    private void EnsureDistributionBuffers(int mipW, int mipH)
+    {
+        if (_condCdfBuffer != null && _distW == mipW && _distH == mipH) return;
+
+        _condCdfBuffer?.Release();
+        _marginalCdfBuffer?.Release();
+        _marginalFuncBuffer?.Release();
+
+        _condCdfBuffer      = new ComputeBuffer(mipH * (mipW + 1), sizeof(float)); // per-row CDF, W+1 entries each
+        _marginalCdfBuffer  = new ComputeBuffer(mipH + 1,          sizeof(float)); // CDF over rows
+        _marginalFuncBuffer = new ComputeBuffer(mipH,              sizeof(float)); // per-row integrals
+        _distW = mipW;
+        _distH = mipH;
     }
 
     // -----------------------------------------------------------------------
