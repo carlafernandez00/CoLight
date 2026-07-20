@@ -320,9 +320,9 @@ MonoBehaviour:
   updateEveryNFrames: 30
   envSphereRadius: 10
   intensityMultiplier: 1
-  mipLevel: 0
+  mipLevel: 2
   method: 1
-  numSamples: 1671
+  numSamples: 512
 --- !u!1 &317906632
 GameObject:
   m_ObjectHideFlags: 0

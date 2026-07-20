@@ -367,7 +367,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.Dispatch(_kernelBuildMarg, 1, 1, 1);
     }
 
-    // Recreates the distribution buffers only when the mip dimensions change.
+    // Sizes the three CDF buffers to the mip dimensions and only rebuilds when they change.
     private void EnsureDistributionBuffers(int mipW, int mipH)
     {
         if (_condCdfBuffer != null && _distW == mipW && _distH == mipH) return;

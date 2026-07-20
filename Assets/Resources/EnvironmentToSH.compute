@@ -253,7 +253,7 @@ void BuildConditionalCDF(uint3 id : SV_DispatchThreadID)
     {
         float  u    = (x + 0.5f) / (float)W;
         float3 c    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;
-        float  func = max(dot(c, LUMA), 0.0f) * sinTheta;   // importance = luminance · sinθ
+        float  func = max(dot(c, LUMA), 0.0f) * sinTheta;   // importance = luminance · sinθ (corrects for equirectangular distortion, so bright regions and poles are both handled)
         acc += func;
         _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
     }
@@ -318,11 +318,14 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     int   H = max(1, _TexHeight >> _MipLevel);
     uint  N = (uint)max(1, _NumSamples);
 
+    // Monte Carlo loop: each thread draws a strided subset of the N Hammersley samples
     for (uint s = threadIndex; s < N; s += NUM_THREADS)
     {
+        // --- Step 1: Hammersley: gives well-spread 2D points xi. Deterministic -> no flicker across frames. ---
         float2 xi = Hammersley(s, N);
 
-        // --- Sample a row v from the marginal CDF (binary search) ---
+        // --- Step 2: Inverse-CDF sampling of the 2D luminance distribution: PBRT Distribution2D sampling algorithm. ---
+        // Sample a row v from the marginal CDF (binary search) 
         int lo = 0, hi = H;
         [loop] while (lo + 1 < hi) { int mid = (lo + hi) >> 1; if (_MarginalCdf[mid] <= xi.x) lo = mid; else hi = mid; }
         int   y      = lo;
@@ -332,7 +335,7 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         float v      = (y + dv) / (float)H;
         float pdfV   = (float)H * mSlope;                    // marginal density (over [0,1])
 
-        // --- Sample a column u from that row's conditional CDF ---
+        // Sample a column u from that row's conditional CDF 
         int cbase = y * (W + 1);
         int lo2 = 0, hi2 = W;
         [loop] while (lo2 + 1 < hi2) { int mid2 = (lo2 + hi2) >> 1; if (_CondCdf[cbase + mid2] <= xi.y) lo2 = mid2; else hi2 = mid2; }
@@ -345,27 +348,36 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
 
         float pdfUV  = pdfU * pdfV;                          // density over the unit uv square
 
-        // --- uv → direction (identical mapping to the full-scan kernel) ---
+        // --- Step 3: uv → direction (identical mapping to the full-scan kernel) ---
         float phi      = (u - 0.5f) * 2.0f * PI;
         float theta    = (1.0f - v) * PI;
         float sinTheta = sin(theta);
         float3 dir = float3(sinTheta * sin(phi), cos(theta), sinTheta * cos(phi));
 
-        // --- uv density → solid-angle density: dΩ = 2π²·sinθ · du·dv ---
+        // --- Step 4: Convert uv density → solid-angle density: dΩ = 2π²·sinθ · du·dv (pdf on the solid-angle density) ---
         float pOmega = pdfUV / (2.0f * PI * PI * max(sinTheta, 1e-4f));
         if (pOmega <= 1e-12f) continue;
-        float invP = 1.0f / pOmega;
 
-        // --- parallax correction (same geometry as full scan) ---
+        float invP = 1.0f / pOmega;  // Monte Carlo weight = 1 / pdf
+
+        // --- Step 5: parallax correction for probe position ---
+        // Q is the point on the env sphere in direction `dir`.
+        // dirProbe is the true direction from probe P to Q — used for SH basis evaluation.
+        // For P=(0,0,0): dirProbe == dir, distSq == R², dOmegaProbe == dOmega exactly.
         float3 Q        = R * dir;
         float3 Vv       = Q - _ProbePosition;
         float  distSq   = max(dot(Vv, Vv), 1e-6f * R * R);
-        float3 dirProbe = Vv * rsqrt(distSq);
+        float3 dirProbe = Vv * rsqrt(distSq);  // normalize(Q - P)
+
+        // Solid angle of this patch as seen from probe P:
+        //   dΩ_probe = R² · sin(θ)dθdφ · dot(D_outward_normal, dirProbe) / dist²
+        //   dot(dir, dirProbe) > 0 always for probes strictly inside the sphere
         float  cosAngle = dot(dir, dirProbe);
         float  geom     = R * R * cosAngle / distSq;         // dΩ_probe / dΩ
 
-        float  w        = geom * invP;
-        float3 color    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;
+        // --- Step 6: Accumulate the weighted SH projection for this sample f(ωₛ)/p(ωₛ) ---
+        float  w        = geom * invP;                                                                 // distribution weight
+        float3 color    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;  // environment color at this direction
 
         gSH[threadIndex][0] += color * SH_Y00()          * w;
         gSH[threadIndex][1] += color * SH_Y1n1(dirProbe) * w;
@@ -379,7 +391,7 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         gWeight[threadIndex] += w;
     }
 
-    // --- Halving reduction (identical to full-scan kernel) ---
+    // Halving reduction to merge 64 partial sums into slot [0]
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint stride = NUM_THREADS / 2; stride > 0; stride >>= 1)
     {
