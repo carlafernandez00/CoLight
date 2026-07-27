@@ -45,6 +45,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
     public int numSamples = 2048;
 
+    [Header("Debug diffuse map (ImportanceSampling only)")]
+    [Tooltip("Save the ambient probe's reconstructed SH to a PNG in Assets/Debug (sized to the env map).")]
+    public bool debugDiffuseMap = true;
+
     // Internal
     private ComputeBuffer _shBuffer;
     private float[]       _shRaw;
@@ -56,6 +60,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _frameCounter;
     private Texture       _currentEnvTex;
     private LightProbes   _runtimeProbes;
+    private RenderTexture _diffuseRenderTexture;          // debug map written by the IS kernel
 
     // Luminance distribution buffers (importance sampling), sized to the mip dims
     private ComputeBuffer _condCdfBuffer;      // mipH * (mipW + 1) floats
@@ -119,6 +124,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _marginalCdfBuffer?.Release();  _marginalCdfBuffer  = null;
         _marginalFuncBuffer?.Release(); _marginalFuncBuffer = null;
         _distW = _distH = 0;
+
+        if (_diffuseRenderTexture != null) { _diffuseRenderTexture.Release(); _diffuseRenderTexture = null; }
     }
 
     void Update()
@@ -266,7 +273,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetInt   ("_NumSamples",      numSamples);
 
         // 1a. Importance sampling: build the luminance distribution ONCE.
-        //     It depends only on the env map, so all probes reuse it.
+        // It depends only on the env map, so all probes reuse it.
         _swBuild.Reset();
         if (method == ProjectionMethod.ImportanceSampling)
         {
@@ -281,6 +288,14 @@ public class EnvironmentSHUpdater : MonoBehaviour
             // Bind the distribution buffers to the sampling kernel
             computeShader.SetBuffer(_kernelIS, "_CondCdf",     _condCdfBuffer);
             computeShader.SetBuffer(_kernelIS, "_MarginalCdf", _marginalCdfBuffer);
+
+            // Bind the debug map, sized to match the env map.
+            int mapW = debugDiffuseMap ? _currentEnvTex.width  : 1;
+            int mapH = debugDiffuseMap ? _currentEnvTex.height : 1;
+            EnsureDiffuseRenderTexture(mapW, mapH);
+            computeShader.SetTexture(_kernelIS, "_DiffuseMap", _diffuseRenderTexture);
+            computeShader.SetInt("_OutWidth",  debugDiffuseMap ? mapW : 0);
+            computeShader.SetInt("_OutHeight", debugDiffuseMap ? mapH : 0);
         }
 
         // 1b. Bind common resources to the active kernel
@@ -339,6 +354,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         File.AppendAllText(_profileLogPath,
             $"{Time.frameCount},{method},{bakedCount + 1},{samples},{buildS:F6},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
+
+        // 8. Dump the debug map to disk (IS only — the full-scan kernel doesn't write it)
+        if (debugDiffuseMap && method == ProjectionMethod.ImportanceSampling)
+            SaveDiffuseMapToDisk();
     }
 
     private void DispatchForProbe(int probeIndex, Vector3 position)
@@ -346,6 +365,45 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetVector("_ProbePosition", position);
         computeShader.SetInt   ("_ProbeIndex",    probeIndex);
         computeShader.Dispatch (_activeKernel, 1, 1, 1);
+    }
+
+    // Creates the debug RenderTexture only when the requested size changes.
+    private void EnsureDiffuseRenderTexture(int w, int h)
+    {
+        if (_diffuseRenderTexture != null && _diffuseRenderTexture.width == w && _diffuseRenderTexture.height == h) return;
+
+        // cleanup old texture if it exists
+        if (_diffuseRenderTexture != null) _diffuseRenderTexture.Release();
+        _diffuseRenderTexture = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBHalf)
+        {
+            enableRandomWrite = true,
+            name = "SHProbeDebugMap"
+        };
+        _diffuseRenderTexture.Create();
+    }
+
+    // Reads the debug map back from the GPU and writes it to Assets/Debug as a PNG.
+    // Overwrites the same file each update so the latest map is always on disk.
+    // PNG is 8-bit, so HDR values above 1 clamp — fine for a quick visual check.
+    private void SaveDiffuseMapToDisk()
+    {
+        if (_diffuseRenderTexture == null) return;
+
+        var prevActive = RenderTexture.active;
+        RenderTexture.active = _diffuseRenderTexture;
+
+        var tex = new Texture2D(_diffuseRenderTexture.width, _diffuseRenderTexture.height, TextureFormat.RGBAFloat, false);
+        tex.ReadPixels(new Rect(0, 0, _diffuseRenderTexture.width, _diffuseRenderTexture.height), 0, 0);
+        tex.Apply();
+
+        RenderTexture.active = prevActive;
+
+        byte[] png = tex.EncodeToPNG();
+        Destroy(tex);
+
+        string path = Path.Combine(Application.dataPath, "Debug", "SHProbeDebugMap.png");
+        File.WriteAllBytes(path, png);
+        Debug.Log($"[EnvironmentSHUpdater] Debug map saved: {path}");
     }
 
     // Builds the PBRT-style Distribution2D (luminance × sinθ) for the current
