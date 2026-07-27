@@ -30,6 +30,13 @@ int                 _NumSamples;            // (Importance sampling only) number
 // Buffer must have at least (_ProbeIndex + 1) * 9 elements.
 RWStructuredBuffer<float3> _SHCoeffs;
 
+// --- Debug map (optional): the SH actually written to the probe 0 ---
+// Equirectangular texture painted at the end of ProjectEquirectToSH_IS for the
+// ambient probe (index 0). 
+RWTexture2D<float4> _DiffuseMap;
+int _OutWidth;          // width  of _DiffuseMap (0 = disabled)
+int _OutHeight;         // height of _DiffuseMap (0 = disabled)
+
 // --- Luminance distribution (importance sampling), built once per env map ---
 // PBRT-style piecewise-constant Distribution2D over the (u,v) unit square,
 // weighted by luminance(texel) * sin(theta) so bright regions AND the equirect
@@ -75,6 +82,24 @@ float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }        
 
 // Rec.709 luminance weights
 #define LUMA float3(0.2126f, 0.7152f, 0.0722f)
+
+// ---------------------------------------------------------------------------
+// Equirectangular UV → spherical angles (Y-up, Unity Panoramic convention).
+// Equirectangular mapping:
+//   u ∈ [0,1]  →  phi   (azimuth)  ∈ [0, 2π]
+//   v ∈ [0,1]  →  theta (polar)    ∈ [0, π]   (0 = north pole)
+//
+//   u=0.5 → phi=0 → +Z, matches Unity's Panoramic skybox convention
+//   v=0   → theta=π (south pole), v=1 → theta=0 (north pole)
+// Used by the debug paint loop; mirrors the inline mapping in the projection kernels.
+// ---------------------------------------------------------------------------
+float3 DirFromUV(float u, float v)
+{
+    float phi      = (u - 0.5f) * 2.0f * PI;
+    float theta    = (1.0f - v) * PI;
+    float sinTheta = sin(theta);
+    return float3(sinTheta * sin(phi), cos(theta), sinTheta * cos(phi));
+}
 
 // ---------------------------------------------------------------------------
 // Hammersley low-discrepancy sequence — used to stratify the Monte Carlo
@@ -143,10 +168,7 @@ void ProjectEquirectToSH(uint3 groupID : SV_GroupID, uint threadIndex : SV_Group
 
             // --- Step 4: base differential solid angle (equirectangular correction) ---
             // Base solid angle: dΩ = sin(θ) · dθ · dφ
-            // sin(θ) corrects for equirectangular distortion:
-            //   poles   (θ→0 or π): sin(θ)→0, low weight
-            //   equator (θ = π/2):  sin(θ)=1, full weight
-            float dOmega = sinTheta * (PI / mipH) * (2.0f * PI / mipW);
+            float dOmega = sinTheta * (PI / mipH) * (2.0f * PI / mipW); // sin(θ) corrects for equirectangular distortion
 
             // --- Step 5: parallax correction for probe position ---
             // Q is the point on the env sphere in direction `dir`.
@@ -348,7 +370,7 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
 
         float pdfUV  = pdfU * pdfV;                          // density over the unit uv square
 
-        // --- Step 3: uv → direction (identical mapping to the full-scan kernel) ---
+        // --- Step 3: UV → spherical angles ---
         float phi      = (u - 0.5f) * 2.0f * PI;
         float theta    = (1.0f - v) * PI;
         float sinTheta = sin(theta);
@@ -358,16 +380,17 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         float pOmega = pdfUV / (2.0f * PI * PI * max(sinTheta, 1e-4f));
         if (pOmega <= 1e-12f) continue;
 
-        float invP = 1.0f / pOmega;  // Monte Carlo weight = 1 / pdf
+        float inv_pOmega = 1.0f / pOmega;  // Monte Carlo weight = 1 / pdf
 
         // --- Step 5: parallax correction for probe position ---
         // Q is the point on the env sphere in direction `dir`.
         // dirProbe is the true direction from probe P to Q — used for SH basis evaluation.
         // For P=(0,0,0): dirProbe == dir, distSq == R², dOmegaProbe == dOmega exactly.
         float3 Q        = R * dir;
-        float3 Vv       = Q - _ProbePosition;
-        float  distSq   = max(dot(Vv, Vv), 1e-6f * R * R);
-        float3 dirProbe = Vv * rsqrt(distSq);  // normalize(Q - P)
+        float3 V        = Q - _ProbePosition;
+        float  distSq   = max(dot(V, V), 1e-6f * R * R);
+        float  dist     = sqrt(distSq);
+        float3 dirProbe = V /dist;  // normalize(Q - P)
 
         // Solid angle of this patch as seen from probe P:
         //   dΩ_probe = R² · sin(θ)dθdφ · dot(D_outward_normal, dirProbe) / dist²
@@ -376,7 +399,7 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         float  geom     = R * R * cosAngle / distSq;         // dΩ_probe / dΩ
 
         // --- Step 6: Accumulate the weighted SH projection for this sample f(ωₛ)/p(ωₛ) ---
-        float  w        = geom * invP;                                                                 // distribution weight
+        float  w        = geom * inv_pOmega;                                                                 // distribution weight (dOmegaProbe/pdf)
         float3 color    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;  // environment color at this direction
 
         gSH[threadIndex][0] += color * SH_Y00()          * w;
@@ -391,7 +414,8 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         gWeight[threadIndex] += w;
     }
 
-    // Halving reduction to merge 64 partial sums into slot [0]
+    // --- Step 7: Halving reduction: merge 64 partial sums into slot [0] ---                                                                        
+    // Each step halves the active set; barrier ensures prior writes are visible.
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint stride = NUM_THREADS / 2; stride > 0; stride >>= 1)
     {
@@ -402,14 +426,50 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         }
         GroupMemoryBarrierWithGroupSync();
     }
-    if (threadIndex != 0) return;
 
-    // Self-normalizing (ratio) estimator: ∫dΩ_probe = 4π for any interior probe,
+    // --- Step 8: Self-normalizing (ratio) estimator: ∫dΩ_probe = 4π for any interior probe,
     // so dividing by the estimated weight sum removes the 1/N factor and any
-    // pdf-normalization drift in one step.
-    float normFactor = (gWeight[0] > 1e-12f) ? (4.0f * PI) / gWeight[0] : 0.0f;
-    [unroll] for (int j = 0; j < 9; j++) gSH[0][j] *= normFactor;
+    // pdf-normalization drift in one step. Thread 0 normalizes gSH[0] and writes
+    // the buffer; a barrier then publishes the normalized coefficients to the group. ---   
+    if (threadIndex == 0)
+    {
+        float normFactor = (gWeight[0] > 1e-12f) ? (4.0f * PI) / gWeight[0] : 0.0f;
+        [unroll] for (int j = 0; j < 9; j++) gSH[0][j] *= normFactor;
 
-    int outBase = _ProbeIndex * 9;
-    [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[outBase + i] = gSH[0][i];
+        // --- Step 9: write coefficients to output buffer ---
+        int outBase = _ProbeIndex * 9;
+        [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[outBase + i] = gSH[0][i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+
+    // --- Step 10: Debug ---
+    // Debug pass: write the SH coefficients just computed for the ambient probe into _DiffuseMap.
+    // For each output texel, reconstruct the diffuse color by evaluating the SH basis
+    // at the texel's direction. The work is distributed across all threads, but only
+    // probe 0 writes to the debug texture. This pass is skipped when _OutWidth/_OutHeight are 0.
+    if (_ProbeIndex == 0)
+    {
+        int total = _OutWidth * _OutHeight;
+        for (int p = (int)threadIndex; p < total; p += NUM_THREADS)
+        {
+            int   px = p % _OutWidth;
+            int   py = p / _OutWidth;
+            float u  = (px + 0.5f) / (float)_OutWidth;
+            float v  = (py + 0.5f) / (float)_OutHeight;
+            float3 n = DirFromUV(u, v);
+
+            float3 c = gSH[0][0] * SH_Y00()
+                     + gSH[0][1] * SH_Y1n1(n)
+                     + gSH[0][2] * SH_Y10 (n)
+                     + gSH[0][3] * SH_Y1p1(n)
+                     + gSH[0][4] * SH_Y2n2(n)
+                     + gSH[0][5] * SH_Y2n1(n)
+                     + gSH[0][6] * SH_Y20 (n)
+                     + gSH[0][7] * SH_Y2p1(n)
+                     + gSH[0][8] * SH_Y2p2(n);
+
+            _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+        }
+    }
 }
