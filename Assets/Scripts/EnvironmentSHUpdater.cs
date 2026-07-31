@@ -45,9 +45,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
     public int numSamples = 2048;
 
-    [Header("Debug diffuse map (ImportanceSampling only)")]
-    [Tooltip("Save the ambient probe's reconstructed SH to a PNG in Assets/Debug (sized to the env map).")]
+    [Header("Debug diffuse map")]
+    [Tooltip("Save one probe's reconstructed SH to a PNG in Assets/Debug/SHProbe (sized to the env map). Works for both methods.")]
     public bool debugDiffuseMap = true;
+
+    [Tooltip("Which probe to visualize/save. 0 = ambient probe (world origin); 1..N = baked probes.")]
+    public int debugProbeIndex = 0;
 
     // Internal
     private ComputeBuffer _shBuffer;
@@ -60,7 +63,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _frameCounter;
     private Texture       _currentEnvTex;
     private LightProbes   _runtimeProbes;
-    private RenderTexture _diffuseRenderTexture;          // debug map written by the IS kernel
+    private RenderTexture _diffuseRenderTexture;          // debug map written by the active kernel
+    private Vector3       _debugProbePos;                 // world position of the probe being debugged (for the filename)
 
     // Luminance distribution buffers (importance sampling), sized to the mip dims
     private ComputeBuffer _condCdfBuffer;      // mipH * (mipW + 1) floats
@@ -101,7 +105,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         EnsureBuffer(1); // at minimum one slot for the ambient probe
 
         // Profiling log setup
-        _profileLogPath = Path.Combine(Application.dataPath, "Debug", "SHProfiler.csv");
+        _profileLogPath = Path.Combine(Application.dataPath, "Debug", "Profiling", "SHProfiler.csv");
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
         File.WriteAllText(_profileLogPath, "frame,method,probeCount,samples,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
@@ -271,6 +275,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetFloat ("_EnvSphereRadius", envSphereRadius);
         computeShader.SetInt   ("_MipLevel",        mipLevel);
         computeShader.SetInt   ("_NumSamples",      numSamples);
+        computeShader.SetInt   ("_DebugProbeIndex", debugDiffuseMap ? debugProbeIndex : -1);
 
         // 1a. Importance sampling: build the luminance distribution ONCE.
         // It depends only on the env map, so all probes reuse it.
@@ -288,29 +293,37 @@ public class EnvironmentSHUpdater : MonoBehaviour
             // Bind the distribution buffers to the sampling kernel
             computeShader.SetBuffer(_kernelIS, "_CondCdf",     _condCdfBuffer);
             computeShader.SetBuffer(_kernelIS, "_MarginalCdf", _marginalCdfBuffer);
-
-            // Bind the debug map, sized to match the env map.
-            int mapW = debugDiffuseMap ? _currentEnvTex.width  : 1;
-            int mapH = debugDiffuseMap ? _currentEnvTex.height : 1;
-            EnsureDiffuseRenderTexture(mapW, mapH);
-            computeShader.SetTexture(_kernelIS, "_DiffuseMap", _diffuseRenderTexture);
-            computeShader.SetInt("_OutWidth",  debugDiffuseMap ? mapW : 0);
-            computeShader.SetInt("_OutHeight", debugDiffuseMap ? mapH : 0);
         }
 
         // 1b. Bind common resources to the active kernel
         computeShader.SetTexture(_activeKernel, "_EquirectMap", _currentEnvTex);
         computeShader.SetBuffer (_activeKernel, "_SHCoeffs",    _shBuffer);
 
+        // 1c. Bind the debug map to the active kernel
+        // sized to match the env map. _OutWidth/_OutHeight = 0 disables the pass.
+        // The DEBUG_DIFFUSE_MAP keyword compiles the debug paint in/out entirely, so
+        // profiling runs (debug off) use a kernel with no debug code — zero cost.
+        if (debugDiffuseMap) computeShader.EnableKeyword("DEBUG_DIFFUSE_MAP");
+        else                 computeShader.DisableKeyword("DEBUG_DIFFUSE_MAP");
+
+        int mapW = debugDiffuseMap ? _currentEnvTex.width  : 1;
+        int mapH = debugDiffuseMap ? _currentEnvTex.height : 1;
+        EnsureDiffuseRenderTexture(mapW, mapH);
+        computeShader.SetTexture(_activeKernel, "_DiffuseMap", _diffuseRenderTexture);
+        computeShader.SetInt("_OutWidth",  debugDiffuseMap ? mapW : 0);
+        computeShader.SetInt("_OutHeight", debugDiffuseMap ? mapH : 0);
+
         // 2. Dispatch probes and set their world-space positions for parallax correction
         // Dispatch for ambient probe (slot 0) — always computed from world origin
         _swDispatch.Restart();
+        _debugProbePos = Vector3.zero;   // probe 0 (ambient) lives at the origin
         DispatchForProbe(0, Vector3.zero);
 
         // Dispatch once per baked probe; fall back to origin if positions are unavailable
         for (int i = 0; i < bakedCount; i++)
         {
             Vector3 pos = (positions != null && i < positions.Length) ? positions[i] : Vector3.zero;
+            if (i + 1 == debugProbeIndex) _debugProbePos = pos;   // remember for the PNG filename
             DispatchForProbe(i + 1, pos);
         }
         _swDispatch.Stop();
@@ -355,8 +368,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         File.AppendAllText(_profileLogPath,
             $"{Time.frameCount},{method},{bakedCount + 1},{samples},{buildS:F6},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
 
-        // 8. Dump the debug map to disk (IS only — the full-scan kernel doesn't write it)
-        if (debugDiffuseMap && method == ProjectionMethod.ImportanceSampling)
+        // 8. Dump the debug map to disk (both methods write it now)
+        if (debugDiffuseMap)
             SaveDiffuseMapToDisk();
     }
 
@@ -382,9 +395,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _diffuseRenderTexture.Create();
     }
 
-    // Reads the debug map back from the GPU and writes it to Assets/Debug as a PNG.
-    // Overwrites the same file each update so the latest map is always on disk.
-    // PNG is 8-bit, so HDR values above 1 clamp — fine for a quick visual check.
+    // Reads the debug map back from the GPU and writes it to Assets/Debug/SHProbe as
+    // a PNG. Filename encodes the probe index, projection method, and world position
+    // of the visualized probe. PNG is 8-bit, so HDR values above 1 clamp — fine for a
+    // quick visual check.
     private void SaveDiffuseMapToDisk()
     {
         if (_diffuseRenderTexture == null) return;
@@ -401,7 +415,14 @@ public class EnvironmentSHUpdater : MonoBehaviour
         byte[] png = tex.EncodeToPNG();
         Destroy(tex);
 
-        string path = Path.Combine(Application.dataPath, "Debug", "SHProbeDebugMap.png");
+        var ic = System.Globalization.CultureInfo.InvariantCulture;
+        Vector3 p = _debugProbePos;
+        string posStr = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
+        string fileName = $"SHProbe_idx{debugProbeIndex}_{method}_{posStr}.png";
+
+        string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, fileName);
         File.WriteAllBytes(path, png);
         Debug.Log($"[EnvironmentSHUpdater] Debug map saved: {path}");
     }

@@ -49,6 +49,10 @@ crashlytics-build.properties
 # Debug frame captures
 DebugFrames/
 
+# SH debug maps & profiling output
+Assets/Debug/
+Assets/Debug.meta
+
 # Per-user XR simulation preferences (not shared)
 Assets/XR/UserSimulationSettings/
 Assets/XR/UserSimulationSettings.meta

@@ -36,12 +36,8 @@ MonoBehaviour:
     rid: 4031487482647806018
   m_OverrideGlobalSceneList: 1
   m_Scenes:
-  - m_enabled: 0
-    m_path: Assets/Scenes/test.unity
-  - m_enabled: 0
-    m_path: Assets/MRUKSamples/Basic/MRUKBase.unity
   - m_enabled: 1
-    m_path: Assets/Scenes/test - light.unity
+    m_path: Assets/Scenes/EnvironmentLightEstimation.unity
   m_HasScriptingDefines: 0
   m_ScriptingDefines: []
   m_PlayerSettingsYaml:
@@ -195,10 +191,6 @@ MonoBehaviour:
         type: 3}'
     - line: '|   - {fileID: 11400000, guid: 47eac9afbada94c5b923fd948ef9249e, type:
         2}'
-    - line: '|   - {fileID: -8963620516618194951, guid: 5bae6ffe3d935400584431285bebf183,
-        type: 2}'
-    - line: '|   - {fileID: 3659384937392410735, guid: d34d947adffca4a5b84f461c588ec43d,
-        type: 2}'
     - line: '|   metroInputSource: 0'
     - line: '|   wsaTransparentSwapchain: 0'
     - line: '|   m_HolographicPauseOnTrackingLoss: 1'
@@ -1036,7 +1028,7 @@ MonoBehaviour:
         m_ExportAsGoogleAndroidProject: 0
         m_DebugSymbolLevel: 1
         m_DebugSymbolFormat: 5
-        m_CurrentDeploymentTargetId: 2G0YC1ZG3G0449
+        m_CurrentDeploymentTargetId: 2G0YC5ZG8W08PR
         m_BuildType: 2
         m_LinkTimeOptimization: 0
         m_BuildAppBundle: 0

@@ -14,6 +14,11 @@
 #pragma kernel BuildConditionalCDF        // Build per-row conditional CDF (u | v) + row integrals
 #pragma kernel BuildMarginalCDF           // Fold row integrals into the marginal CDF (v)
 
+// Debug diffuse-map paint is compiled in ONLY when this keyword is enabled, so
+// profiling/normal runs use a kernel with zero debug code (no register/occupancy
+// cost). C# toggles it via EnableKeyword/DisableKeyword("DEBUG_DIFFUSE_MAP").
+#pragma multi_compile _ DEBUG_DIFFUSE_MAP
+
 // --- Inputs ---
 Texture2D<float4>   _EquirectMap;           // Equirectangular environment map (Skybox/Panoramic texture)
 SamplerState        sampler_EquirectMap;    // Sampler for _EquirectMap
@@ -36,6 +41,7 @@ RWStructuredBuffer<float3> _SHCoeffs;
 RWTexture2D<float4> _DiffuseMap;
 int _OutWidth;          // width  of _DiffuseMap (0 = disabled)
 int _OutHeight;         // height of _DiffuseMap (0 = disabled)
+int _DebugProbeIndex;   // probe for which the debug map is written 
 
 // --- Luminance distribution (importance sampling), built once per env map ---
 // PBRT-style piecewise-constant Distribution2D over the (u,v) unit square,
@@ -245,6 +251,38 @@ void ProjectEquirectToSH(uint3 groupID : SV_GroupID, uint threadIndex : SV_Group
     // --- Step 11: write coefficients to output buffer ---
     int base = _ProbeIndex * 9;
     [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[base + i] = gSH[0][i];
+
+    // --- Step 12: Debug ---
+    // Debug pass: write the SH just computed for probe _DebugProbeIndex into _DiffuseMap.
+    // For each output texel, reconstruct the diffuse color by evaluating the SH basis
+    // at the texel's direction. Only thread 0 is alive here, so the loop is NON-strided.
+    // Compiled in only when DEBUG_DIFFUSE_MAP is enabled; skipped when _OutWidth/_OutHeight are 0.
+#ifdef DEBUG_DIFFUSE_MAP
+    if (_ProbeIndex == _DebugProbeIndex)
+    {
+        int total = _OutWidth * _OutHeight;
+        for (int p = 0; p < total; p++)
+        {
+            int   px = p % _OutWidth;
+            int   py = p / _OutWidth;
+            float u  = (px + 0.5f) / (float)_OutWidth;
+            float v  = (py + 0.5f) / (float)_OutHeight;
+            float3 n = DirFromUV(u, v);
+
+            float3 c = gSH[0][0] * SH_Y00()
+                     + gSH[0][1] * SH_Y1n1(n)
+                     + gSH[0][2] * SH_Y10 (n)
+                     + gSH[0][3] * SH_Y1p1(n)
+                     + gSH[0][4] * SH_Y2n2(n)
+                     + gSH[0][5] * SH_Y2n1(n)
+                     + gSH[0][6] * SH_Y20 (n)
+                     + gSH[0][7] * SH_Y2p1(n)
+                     + gSH[0][8] * SH_Y2p2(n);
+
+            _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+        }
+    }
+#endif // DEBUG_DIFFUSE_MAP
 }
 
 // ===========================================================================
@@ -447,8 +485,10 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     // Debug pass: write the SH coefficients just computed for the ambient probe into _DiffuseMap.
     // For each output texel, reconstruct the diffuse color by evaluating the SH basis
     // at the texel's direction. The work is distributed across all threads, but only
-    // probe 0 writes to the debug texture. This pass is skipped when _OutWidth/_OutHeight are 0.
-    if (_ProbeIndex == 0)
+    // only probe _DebugProbeIndex writes. This pass is skipped when _OutWidth/_OutHeight are 0.
+    // Compiled in only when DEBUG_DIFFUSE_MAP is enabled.
+#ifdef DEBUG_DIFFUSE_MAP
+    if (_ProbeIndex == _DebugProbeIndex)
     {
         int total = _OutWidth * _OutHeight;
         for (int p = (int)threadIndex; p < total; p += NUM_THREADS)
@@ -472,4 +512,5 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
             _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
         }
     }
+#endif // DEBUG_DIFFUSE_MAP
 }
