@@ -125,7 +125,7 @@ public class LightEstimationManager : MonoBehaviour
 #else
         if (!m_cameraAccess.IsPlaying)
             return;
-        if (!m_previewAssigned && m_preview != null)
+        if (!_previewAssigned && m_preview != null)
         {
             m_preview.texture = m_cameraAccess.GetTexture();
             _previewAssigned = true;
