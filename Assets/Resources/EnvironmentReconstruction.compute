@@ -1,0 +1,124 @@
+// Reconstructs an equirectangular (panoramic 2D) environment map from the Quest 3
+// passthrough color camera and the Environment Depth API, one texel at a time.
+//
+// Method: GATHER (output-driven). We iterate over every texel of the output
+// panorama, convert it to a world-space direction, then project that direction
+// back into the color sensor and the depth camera to fetch color + metric depth.
+// This is the inverse of a "scatter" (paint each camera pixel into the panorama)
+// approach — gather guarantees no holes from equirectangular pole-stretching and
+// lets each texel be owned by exactly one thread (clean temporal accumulation,
+// no atomics).
+//
+// v1: full-sphere dispatch (no FOV bounding box). Texels whose direction is not
+// currently visible to the camera are simply left untouched, so the panorama
+// fills in as the user scans the room across many frames (newest sample wins).
+//
+// The (u,v) <-> direction convention MUST match EnvironmentToSH.compute so the SH
+// projection stage reads this map back with the correct orientation:
+//   phi   = (u - 0.5) * 2PI      u=0.5 -> phi=0 -> +Z (forward)
+//   theta = (1 - v) * PI         v=1   -> +Y (north pole), v=0 -> -Y (south pole)
+//   D = (sinT*sin(phi), cos(theta), sinT*cos(phi))
+
+#pragma kernel ReconstructEquirect
+
+#define PI 3.14159265f
+
+// ── Outputs (persistent equirect panoramas, never cleared per-frame) ──────────
+RWTexture2D<float4> _ColorEquirect;   // rgb = linear color, a = 1 where filled
+RWTexture2D<float>  _DepthEquirect;   // linear metric depth in meters, 0 = unknown
+
+int _OutWidth;
+int _OutHeight;
+
+// ── Color camera (Meta PassthroughCameraAccess) ──────────────────────────────
+float4x4 _ColorInvPose;     // rigid world -> camera-local transform (+Z forward, matching the camera space)
+float2   _ColorFocal;       // intrinsics focal length (sensor px)
+float2   _ColorPrincipal;   // intrinsics principal point (sensor px) -> center of projection
+float4   _ColorCropRegion;  // (x, y, width, height) sensor crop, in sensor px
+float3   _AnchorPos;        // world-space capture origin (color camera position)
+
+Texture2D<float4> _ColorTex;
+SamplerState      sampler_ColorTex;
+
+// ── Depth (Meta EnvironmentDepthManager globals) ─────────────────────────────
+// _EnvironmentDepthTexture is bound from the global via SetTextureFromGlobal;
+// the reprojection matrices and z-buffer params are read as global uniforms
+Texture2DArray<float> _EnvironmentDepthTexture;
+SamplerState          sampler_EnvironmentDepthTexture;
+float4x4              _EnvironmentDepthReprojectionMatrices[2];
+float4                _EnvironmentDepthZBufferParams;
+
+[numthreads(8, 8, 1)]
+void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _OutWidth || (int)id.y >= _OutHeight) return;
+
+    // ── Step 1: texel -> (u,v) -> world direction (matches EnvironmentToSH) ──
+    float u = (id.x + 0.5f) / (float)_OutWidth;
+    float v = (id.y + 0.5f) / (float)_OutHeight;
+
+    float phi   = (u - 0.5f) * 2.0f * PI;
+    float theta = (1.0f - v) * PI;
+    float sinT  = sin(theta);
+    float3 D = float3(sinT * sin(phi), cos(theta), sinT * cos(phi));
+
+    // world point along this direction -> unit vector from the color camera origin
+    float3 worldP = _AnchorPos + D;
+
+    // ── Step 2: COLOR — project direction into the passthrough sensor ────────
+    // Port of PassthroughCameraAccess.WorldToViewportPoint
+    // worldP relative to the color camera origin, in camera space (Z forward, X right, Y up)
+    float3 camSpace = mul(_ColorInvPose, float4(worldP, 1.0f)).xyz;
+
+    // check it's in front of the camera -> only half the sphere is visible
+    if (camSpace.z > 1e-5f)  
+    {
+        // 2D pixel coordinates in color sensor space
+        float2 sensor = float2(
+            (camSpace.x / camSpace.z) * _ColorFocal.x + _ColorPrincipal.x,
+            (camSpace.y / camSpace.z) * _ColorFocal.y + _ColorPrincipal.y);
+        
+        // normalized coordinate in the cropped sensor region (0..1 in each dimension)
+        float2 vp = float2(
+            (sensor.x - _ColorCropRegion.x) / _ColorCropRegion.z,
+            (sensor.y - _ColorCropRegion.y) / _ColorCropRegion.w);
+
+        // check if it's inside the camera's view
+        if (vp.x >= 0.0f && vp.x <= 1.0f && vp.y >= 0.0f && vp.y <= 1.0f)
+        {
+            float3 color = _ColorTex.SampleLevel(sampler_ColorTex, vp, 0).rgb;
+            _ColorEquirect[id.xy] = float4(color, 1.0f);   // newest sample wins
+        }
+    }
+
+    // ── Step 3: DEPTH — project direction into the depth camera ──────────────
+    // Port of CalculateEnvironmentDepthOcclusion / SampleEnvironmentDepthLinear.
+    // Slice 0 = left eye, matching the left color camera and reproj matrix [0].
+    // depthClip: world → camera + the projection matrix
+    float4 depthClip = mul(_EnvironmentDepthReprojectionMatrices[0], float4(worldP, 1.0f));
+
+    // check it's in front of the camera -> only half the sphere is visible
+    if (depthClip.w > 1e-5f)
+    {
+        // normalized device coordinates: NDC [-1,1] → UV [0,1]
+        float2 dUV = (depthClip.xy / depthClip.w + 1.0f) * 0.5f;
+
+        // check if it's inside the camera's view
+        if (dUV.x >= 0.0f && dUV.x <= 1.0f && dUV.y >= 0.0f && dUV.y <= 1.0f)
+        {
+            float dEye = _EnvironmentDepthTexture.SampleLevel(
+                sampler_EnvironmentDepthTexture, float3(dUV, 0.0f), 0).r;
+            
+            // Convert the depth from eye space to linear metric depth in meters.
+            float ndc = dEye * 2.0f - 1.0f; 
+            float denominator = ndc + _EnvironmentDepthZBufferParams.y;
+            // denominator == 0 happens at the far plane (ndc == 1, y == -1) -> skip.
+            if (abs(denominator) > 1e-6f)
+            {
+                float linearDepth = (1.0f / denominator) * _EnvironmentDepthZBufferParams.x;
+                if (linearDepth > 0.0f && linearDepth < 9999.0f)
+                    _DepthEquirect[id.xy] = linearDepth;   // meters, newest wins
+            }
+        }
+    }
+}
