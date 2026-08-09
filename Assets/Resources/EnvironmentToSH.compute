@@ -373,6 +373,7 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     [unroll] for (int k = 0; k < 9; k++) gSH[threadIndex][k] = float3(0, 0, 0);
     gWeight[threadIndex] = 0.0f;
 
+    // Mip-level dims and number of samples (importance sampling)
     float R = _EnvSphereRadius;
     int   W = max(1, _TexWidth  >> _MipLevel);
     int   H = max(1, _TexHeight >> _MipLevel);
