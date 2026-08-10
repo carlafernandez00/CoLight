@@ -442,10 +442,10 @@ MonoBehaviour:
   envSphereRadius: 10
   intensityMultiplier: 1
   mipLevel: 2
-  method: 0
+  method: 1
   numSamples: 512
   debugDiffuseMap: 1
-  debugProbeIndex: 0
+  debugProbeIndex: 9
 --- !u!1 &317906632
 GameObject:
   m_ObjectHideFlags: 0
