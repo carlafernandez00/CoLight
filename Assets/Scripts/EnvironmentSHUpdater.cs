@@ -104,8 +104,14 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _kernelBuildMarg = computeShader.FindKernel("BuildMarginalCDF");
         EnsureBuffer(1); // at minimum one slot for the ambient probe
 
-        // Profiling log setup
+        // Profiling log setup.
+        // Editor: project-relative Debug folder (easy to find in Finder).
+        // Device: persistentDataPath is the only writable location on Android/Quest.
+#if UNITY_EDITOR
         _profileLogPath = Path.Combine(Application.dataPath, "Debug", "Profiling", "SHProfiler.csv");
+#else
+        _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
+#endif
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
         File.WriteAllText(_profileLogPath, "frame,method,probeCount,samples,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
@@ -412,18 +418,26 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         RenderTexture.active = prevActive;
 
-        byte[] png = tex.EncodeToPNG();
+        // byte[] png = tex.EncodeToPNG();
+        byte[] exr = tex.EncodeToEXR(Texture2D.EXRFlags.OutputAsFloat);
         Destroy(tex);
 
         var ic = System.Globalization.CultureInfo.InvariantCulture;
         Vector3 p = _debugProbePos;
         string posStr = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
-        string fileName = $"SHProbe_idx{debugProbeIndex}_{method}_{posStr}.png";
+        // string fileName = $"SHProbe_idx{debugProbeIndex}_{method}_{posStr}.png";
+        string fileName = $"SHProbe_idx{debugProbeIndex}_{method}_{posStr}.exr";
 
+#if UNITY_EDITOR
         string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
+#else
+        string dir = Path.Combine(Application.persistentDataPath, "SHProbe");
+#endif
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, fileName);
-        File.WriteAllBytes(path, png);
+
+        // File.WriteAllBytes(path, png);
+        File.WriteAllBytes(path, exr);
         Debug.Log($"[EnvironmentSHUpdater] Debug map saved: {path}");
     }
 
