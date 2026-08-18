@@ -1,7 +1,8 @@
 // Visualises the reconstructed equirectangular DEPTH panorama (RFloat, linear
-// meters) as a greyscale image for a debug canvas.
-//   near = white, far = black (normalised by _MaxDepth)
-//   unseen texels (depth == 0) = dark blue, so "not scanned yet" reads distinctly
+// meters) as a blue-ramp image for a debug canvas.
+//   near = light blue, far = dark blue (normalised by _MaxDepth)
+//   unseen texels (depth == 0) = black, so scanned coverage "paints in" as blue
+//   against black and is easy to watch initialise.
 // Used by EnvironmentMapReconstructor via Graphics.Blit(depthRT, displayRT, mat).
 Shader "EquirectDepthVisualize"
 {
@@ -34,11 +35,13 @@ Shader "EquirectDepthVisualize"
 
                 // depth == 0 -> this direction has not been scanned yet
                 if (meters <= 0.0)
-                    return fixed4(0.0, 0.0, 0.3, 1.0);   // dark blue = unseen
+                    return fixed4(0.0, 0.0, 0.0, 1.0);   // black = unseen
 
-                float g = saturate(meters / max(_MaxDepth, 1e-3));
-                g = 1.0 - g;                             // near = white, far = black
-                return fixed4(g, g, g, 1.0);
+                // Scanned: light blue (near) -> dark blue (far), normalised by _MaxDepth.
+                float t = saturate(meters / max(_MaxDepth, 1e-3));   // 0 near .. 1 far
+                fixed3 nearCol = fixed3(0.70, 0.90, 1.00);           // light blue
+                fixed3 farCol  = fixed3(0.00, 0.10, 0.40);           // dark blue
+                return fixed4(lerp(nearCol, farCol, t), 1.0);
             }
             ENDCG
         }
