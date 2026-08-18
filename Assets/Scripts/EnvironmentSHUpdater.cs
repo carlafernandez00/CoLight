@@ -113,7 +113,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
 #endif
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
-        File.WriteAllText(_profileLogPath, "frame,method,probeCount,samples,build_s,dispatch_s,readback_s,total_s\n");
+        File.WriteAllText(_profileLogPath, "frame,method,probeCount,samples,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
 
         // Create a detached LightProbes clone and make it the active probe set.
@@ -372,7 +372,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
                   $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
 
         File.AppendAllText(_profileLogPath,
-            $"{Time.frameCount},{method},{bakedCount + 1},{samples},{buildS:F6},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
+            $"{Time.frameCount},{method},{bakedCount + 1},{samples},{mipLevel},{buildS:F6},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
 
         // 8. Dump the debug map to disk (both methods write it now)
         if (debugDiffuseMap)
