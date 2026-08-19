@@ -425,8 +425,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
         var ic = System.Globalization.CultureInfo.InvariantCulture;
         Vector3 p = _debugProbePos;
         string posStr = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
-        // string fileName = $"SHProbe_idx{debugProbeIndex}_{method}_{posStr}.png";
-        string fileName = $"SHProbe_idx{debugProbeIndex}_{method}_{posStr}.exr";
+        // Sample count only applies to importance sampling; omit it for FullScan.
+        string samplesStr = (method == ProjectionMethod.ImportanceSampling) ? $"_N={numSamples}" : "";
+        // string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.png";
+        string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.exr";
 
 #if UNITY_EDITOR
         string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
