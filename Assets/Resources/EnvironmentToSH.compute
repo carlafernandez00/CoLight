@@ -254,6 +254,8 @@ void BuildConditionalCDF(uint3 id : SV_DispatchThreadID)
         float  u    = (x + 0.5f) / (float)W;
         float3 c    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;
         float  func = max(dot(c, LUMA), 0.0f) * sinTheta;   // importance = luminance · sinθ (corrects for equirectangular distortion, so bright regions and poles are both handled)
+        // float func = max(max(c.r, c.g), c.b) * sinTheta;       // color aware
+
         acc += func;
         _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
     }
@@ -317,6 +319,26 @@ float radicalInverse_VdC(uint bits)
 float2 Hammersley(uint i, uint N) { return float2((float)i / (float)N, radicalInverse_VdC(i)); }
 
 
+// ---------------------------------------------------------------------------
+// Random
+// ---------------------------------------------------------------------------
+uint WangHash(uint s)
+{
+    s = (s ^ 61u) ^ (s >> 16u);
+    s *= 9u;
+    s = s ^ (s >> 4u);
+    s *= 0x27d4eb2du;
+    s = s ^ (s >> 15u);
+    return s;
+}
+float2 Random2(uint i, uint seed)
+{
+    uint h1 = WangHash(i * 747796405u + seed * 2891336453u);
+    uint h2 = WangHash(h1);
+    return float2(h1 * 2.3283064365386963e-10f,
+                  h2 * 2.3283064365386963e-10f);
+}
+
 // ===========================================================================
 // Importance-sampling projection kernel
 // One thread group per probe (dispatch (1,1,1) per probe, like the full scan).
@@ -341,18 +363,24 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     {
         // 1: Hammersley: gives well-spread 2D points xi. Deterministic -> no flicker across frames
         float2 xi = Hammersley(s, N);
+        // float2 xi = Random2(s, 0u); 
 
         // 2: Inverse-CDF sampling of the 2D luminance distribution: PBRT Distribution2D sampling algorithm
         // Pick a row v from the marginal CDF (binary search) 
+        // TODO: create function
         int lo = 0, hi = H;
-        [loop] while (lo + 1 < hi) { int mid = (lo + hi) >> 1; if (_MarginalCdf[mid] <= xi.x) lo = mid; else hi = mid; }
+        [loop] while (lo + 1 < hi) { 
+            int mid = (lo + hi) >> 1;           // midpoint of the current search window
+            if (_MarginalCdf[mid] <= xi.x)      
+                lo = mid;                       // if lower or eq than xi.x, look into higher rows
+            else                       
+                hi = mid;                       // look into lower rows 
+        }
         int   y      = lo;
         float m0     = _MarginalCdf[y];
         float m1     = _MarginalCdf[y + 1];
-        float mSlope = m1 - m0;
-        float dv     = (mSlope > 0.0f) ? (xi.x - m0) / mSlope : 0.5f;
-        float v      = (y + dv) / (float)H;
-        float pdfV   = (float)H * mSlope;                    // marginal density (over [0,1])
+        float mSlope = m1 - m0;                 // width of the boundaries = row "y" probability
+        float pdfV   = (float)H * mSlope;       // marginal density (over [0,1])
 
         // Pick a column u from that row's conditional CDF 
         int cbase = y * (W + 1);
@@ -360,19 +388,24 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         [loop] while (lo2 + 1 < hi2) { int mid2 = (lo2 + hi2) >> 1; if (_CondCdf[cbase + mid2] <= xi.y) lo2 = mid2; else hi2 = mid2; }
         int   x      = lo2;
         float c0     = _CondCdf[cbase + x];
-        float c1 = _CondCdf[cbase + x + 1];
+        float c1     = _CondCdf[cbase + x + 1];
         float cSlope = c1 - c0;
-        float du     = (cSlope > 0.0f) ? (xi.y - c0) / cSlope : 0.5f;
-        float u      = (x + du) / (float)W;
         float pdfU   = (float)W * cSlope;                    // conditional density (over [0,1])
-
+    
         float pdfUV  = pdfU * pdfV;                          // density over the unit uv square
+        float v      = (y + 0.5) / (float)H;
+        float u      = (x + 0.5) / (float)W;
+
 
         // 3: UV → spherical angles  with Y-up 
         float phi      = (u - 0.5f) * 2.0f * PI;
         float theta    = (1.0f - v) * PI;
         float sinTheta = sin(theta);
-        float3 dir = float3(sinTheta * sin(phi), cos(theta), sinTheta * cos(phi));
+        float3 dir = float3(
+            sinTheta * sin(phi),    // x 
+            cos(theta),             // y (up) (Unity convention)
+            sinTheta * cos(phi)     // z
+        );
 
         // 4: UV density → solid-angle density: dΩ = 2π²·sinθ · du·dv
         float pOmega = pdfUV / (2.0f * PI * PI * max(sinTheta, 1e-4f));
@@ -419,8 +452,8 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     // 8: normalization and write-out (thread 0 only)  
     if (threadIndex == 0)
     {
-        float normFactor = (4.0f * PI) / gWeight[0];  // ratio (self-normalized) estimator
-        // float normFactor = 1.0f / (float)max(1, _NumSamples);
+        // float normFactor = (4.0f * PI) / gWeight[0];  // ratio (self-normalized) estimator
+        float normFactor = 1.0f / (float)max(1, _NumSamples);
         [unroll] for (int j = 0; j < 9; j++) gSH[0][j] *= normFactor;
 
         int outBase = _ProbeIndex * 9;
