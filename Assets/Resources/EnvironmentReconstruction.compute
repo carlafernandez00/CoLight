@@ -96,6 +96,7 @@ void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
     // Slice 0 = left eye, matching the left color camera and reproj matrix [0].
     // depthClip: world → camera + the projection matrix
     float4 depthClip = mul(_EnvironmentDepthReprojectionMatrices[0], float4(worldP, 1.0f));
+    
 
     // check it's in front of the camera -> only half the sphere is visible
     if (depthClip.w > 1e-5f)
