@@ -371,8 +371,11 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Debug.Log($"[EnvironmentSHUpdater] SH updated ({method}) — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
                   $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
 
-        File.AppendAllText(_profileLogPath,
-            $"{Time.frameCount},{method},{bakedCount + 1},{samples},{mipLevel},{buildS:F6},{dispatchS:F6},{readbackS:F6},{totalS:F6}\n");
+        // InvariantCulture forces '.' as the decimal separator; on Quest the device
+        // locale may default to ',', which would corrupt the CSV columns.
+        File.AppendAllText(_profileLogPath, string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "{0},{1},{2},{3},{4},{5:F6},{6:F6},{7:F6},{8:F6}\n",
+            Time.frameCount, method, bakedCount + 1, samples, mipLevel, buildS, dispatchS, readbackS, totalS));
 
         // 8. Dump the debug map to disk (both methods write it now)
         if (debugDiffuseMap)
