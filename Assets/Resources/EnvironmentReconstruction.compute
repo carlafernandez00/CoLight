@@ -94,9 +94,16 @@ void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
     // ── Step 3: DEPTH — project direction into the depth camera ──────────────
     // Port of CalculateEnvironmentDepthOcclusion / SampleEnvironmentDepthLinear.
     // Slice 0 = left eye, matching the left color camera and reproj matrix [0].
-    // depthClip: world → camera + the projection matrix
-    float4 depthClip = mul(_EnvironmentDepthReprojectionMatrices[0], float4(worldP, 1.0f));
-    
+    //
+    // Project the DIRECTION at infinity (w = 0), NOT the 1 m point (w = 1). The
+    // reprojection matrix is the depth camera's full world→clip transform with its
+    // own origin, so feeding a finite point does NOT cancel the translation the way
+    // color's _ColorInvPose cancels _AnchorPos — the translation then dominates,
+    // w stays positive for every direction (no front/back cull → whole texture),
+    // and the mapping folds/duplicates. Using (D, 0) drops the translation column:
+    // this is the distant-environment assumption, and makes w = dot(depthFwd, D)
+    // so the w > 0 test correctly keeps only the front hemisphere.
+    float4 depthClip = mul(_EnvironmentDepthReprojectionMatrices[0], float4(D, 0.0f));
 
     // check it's in front of the camera -> only half the sphere is visible
     if (depthClip.w > 1e-5f)
