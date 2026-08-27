@@ -8,22 +8,12 @@ using UnityEngine.UI;
 /// over time as the user scans the room.
 ///
 /// Two aligned panoramas are produced (same layout, same texel = same direction):
-///   - Color panorama : linear RGB, ready to feed EnvironmentSHUpdater.
+///   - Color panorama : linear RGB, alpha channel 0 = not yet seen.
 ///   - Depth panorama : linear metric depth (meters), 0 = not yet seen.
-///
-/// The heavy lifting is in EnvironmentReconstruction.compute (gather kernel). This
-/// component just gathers the per-frame inputs — color texture, camera intrinsics,
-/// camera pose, and the global depth uniforms — and dispatches the kernel.
-///
-/// The (u,v) <-> direction convention matches EnvironmentToSH.compute, so the color
-/// panorama can be handed straight to EnvironmentSHUpdater.SetEnvironmentTexture().
-///
-/// notes / approximations:
-///   - Left eye only (single PassthroughCameraAccess instance, CameraPosition = Left).
-///   - Full-sphere dispatch every update (no FOV bounding box yet). TODO: FOV bounding box
+/// 
+/// Notice:
 ///   - Color and depth sensors are treated as ~coincident at the head for the depth
 ///     projection (they differ by a few cm of lens offset).
-///   - Depth stored as eye-space linear depth.
 ///   - Not available in the Unity Editor (needs passthrough + depth on device).
 /// </summary>
 public class EnvironmentMapReconstructor : MonoBehaviour
@@ -78,7 +68,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private static readonly int DepthTexGlobalName = Shader.PropertyToID("_EnvironmentDepthTexture");
     private static readonly int ZBufferParamsID   = Shader.PropertyToID("_EnvironmentDepthZBufferParams");
 
-    // ──────────────────────────────────────────────────────────────────────────
+
     private void Awake()
     {
 #if UNITY_EDITOR
@@ -118,10 +108,11 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
     private void CreatePanoramas()
     {
+        // enableRandomWrite false to allow writing at any texel
         _colorRT = new RenderTexture(m_width, m_height, 0, RenderTextureFormat.ARGBHalf)
         {
-            enableRandomWrite = true,
-            useMipMap = false,
+            enableRandomWrite = true,      
+            useMipMap = false,                   
             name = "EnvColorEquirect"
         };
         _colorRT.Create();
@@ -134,17 +125,16 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         };
         _depthRT.Create();
 
-        // Start empty (color = transparent black, depth = 0 = "unseen"). Persistent
-        // across frames afterwards so coverage accumulates as the user scans.
+        // Start empty (color = transparent black, depth = 0 = "unseen").
         // ClearRT(_colorRT, Color.clear);
         // TODO: Clean magenta preview
         ClearRT(_colorRT, Color.magenta);
         ClearRT(_depthRT, Color.clear);
 
-        // Color panorama can be shown directly. Depth is metric meters, so it goes
-        // through a greyscale display texture updated each dispatch.
+        // Color panorama can be shown directly
         if (m_colorPreview != null) m_colorPreview.texture = _colorRT;
 
+        // Depth is metric meters -> it goes through a bluescale display texture updated each dispatch
         if (m_depthPreview != null && _depthVizMat != null)
         {
             _depthDisplayRT = new RenderTexture(m_width, m_height, 0, RenderTextureFormat.ARGB32)
@@ -165,7 +155,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         RenderTexture.active = prev;
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
+
     private void Update()
     {
 #if UNITY_EDITOR
@@ -202,12 +192,17 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
     private void Dispatch()
     {
-        // Get the latest color texture and camera pose/intrinsics. If the color camera
-        // is not delivering frames yet, skip this update.
+        // Get the latest color texture and camera pose/intrinsics
         var colorTex = m_cameraAccess.GetTexture();
+
+        // If the color camera is not delivering frames yet, skip this update.
         if (colorTex == null)
         {
-            if (!_loggedNullTex) { Debug.LogWarning("[EnvReconstruct] Camera is playing but GetTexture() returned null — no color frame yet."); _loggedNullTex = true; }
+            if (!_loggedNullTex) 
+            { 
+                Debug.LogWarning("[EnvReconstruct] Camera is playing but GetTexture() returned null — no color frame yet."); 
+                _loggedNullTex = true; 
+            }
             return;
         }
 
@@ -217,19 +212,18 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         // World -> camera-local (rigid, +Z forward), matching WorldToViewportPoint.
         Matrix4x4 invPose = Matrix4x4.TRS(pose.position, pose.rotation, Vector3.one).inverse;
 
-        // Sensor crop region — replicates PassthroughCameraAccess.CalcSensorCropRegion.
-        // sensor's active region
+        // sensor's active region at the current resolution (replicates PassthroughCameraAccess.CalcSensorCropRegion)
         Vector2 sensorRes = intr.SensorResolution;
         Vector2 curRes    = m_cameraAccess.CurrentResolution;
         Vector2 scale = new Vector2(curRes.x / sensorRes.x, curRes.y / sensorRes.y);
-        scale /= Mathf.Max(scale.x, scale.y);
+        scale /= Mathf.Max(scale.x, scale.y);      // one component exactly 1
         Vector4 crop = new Vector4(
             sensorRes.x * (1f - scale.x) * 0.5f,
             sensorRes.y * (1f - scale.y) * 0.5f,
             sensorRes.x * scale.x,
             sensorRes.y * scale.y);
 
-        // ── Bind everything ──────────────────────────────────────────────────
+        // BIND EVERYTHING
         m_computeShader.SetInt("_OutWidth",  m_width);
         m_computeShader.SetInt("_OutHeight", m_height);
 
@@ -243,10 +237,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         m_computeShader.SetTexture(_kernel, ColorEquirectID, _colorRT);
         m_computeShader.SetTexture(_kernel, DepthEquirectID, _depthRT);
 
-        // Depth: bind the global depth texture explicitly; the reprojection matrices
-        // and z-buffer params are read as global uniforms by the compute shader.
-        // matrix array - comes through the global path
-        // z-buffer params - comes through the global path but we pass it just in case
+        // depth texture and parms come from Meta global 
         m_computeShader.SetTextureFromGlobal(_kernel, DepthTexGlobalName, DepthTexGlobalName);
         m_computeShader.SetVector(ZBufferParamsID, Shader.GetGlobalVector(ZBufferParamsID));
 
@@ -255,7 +246,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         int groupsY = Mathf.CeilToInt(m_height / 8f);
         m_computeShader.Dispatch(_kernel, groupsX, groupsY, 1);
 
-        // Refresh the greyscale depth preview from the updated metric depth map.
+        // Refresh the greyscale depth preview from the updated metric depth map
         if (_depthDisplayRT != null && _depthVizMat != null)
         {
             _depthVizMat.SetFloat(MaxDepthID, m_depthPreviewMaxMeters);
@@ -263,7 +254,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         }
     }
 
-    /// <summary>Reset both panoramas to empty (e.g. to re-scan the room).</summary>
+    /// <summary>Reset both panoramas to empty.</summary>
     public void ResetMaps()
     {
         if (_colorRT != null) ClearRT(_colorRT, Color.clear);
