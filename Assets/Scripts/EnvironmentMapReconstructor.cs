@@ -209,25 +209,32 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         var intr = m_cameraAccess.Intrinsics;
         Pose pose = m_cameraAccess.GetCameraPose();
 
-        // World -> camera-local (rigid, +Z forward), matching WorldToViewportPoint.
-        Matrix4x4 invPose = Matrix4x4.TRS(pose.position, pose.rotation, Vector3.one).inverse;
-
         // sensor's active region at the current resolution (replicates PassthroughCameraAccess.CalcSensorCropRegion)
         Vector2 sensorRes = intr.SensorResolution;
         Vector2 curRes    = m_cameraAccess.CurrentResolution;
         Vector2 scale = new Vector2(curRes.x / sensorRes.x, curRes.y / sensorRes.y);
         scale /= Mathf.Max(scale.x, scale.y);      // one component exactly 1
         Vector4 crop = new Vector4(
-            sensorRes.x * (1f - scale.x) * 0.5f,
-            sensorRes.y * (1f - scale.y) * 0.5f,
-            sensorRes.x * scale.x,
-            sensorRes.y * scale.y);
+            sensorRes.x * (1f - scale.x) * 0.5f,    // top left (coord x) of the crop region in sensor space
+            sensorRes.y * (1f - scale.y) * 0.5f,    // top left (coord y) of the crop region in sensor space
+            sensorRes.x * scale.x,                  // width of the crop region in sensor space
+            sensorRes.y * scale.y);                 // height of the crop region in sensor space
+        
+        // Define color camera projection matrix: P = K * [R|t]; for K considering the crop region
+        Matrix4x4 invCameraPose = Matrix4x4.TRS(pose.position, pose.rotation, Vector3.one).inverse;
+        Matrix4x4 K = Matrix4x4.identity;
+        K.m00 =  intr.FocalLength.x    / crop.z;
+        K.m02 = (intr.PrincipalPoint.x - crop.x) / crop.z;
+        K.m11 =  intr.FocalLength.y    / crop.w;
+        K.m12 = (intr.PrincipalPoint.y - crop.y) / crop.w;
+
+        Matrix4x4 colorProjectionMatrix = K * invCameraPose;
 
         // BIND EVERYTHING
         m_computeShader.SetInt("_OutWidth",  m_width);
         m_computeShader.SetInt("_OutHeight", m_height);
 
-        m_computeShader.SetMatrix("_ColorInvPose", invPose);
+        m_computeShader.SetMatrix("_ColorProjectionMatrix", colorProjectionMatrix);
         m_computeShader.SetVector("_ColorFocal",     intr.FocalLength);
         m_computeShader.SetVector("_ColorPrincipal", intr.PrincipalPoint);
         m_computeShader.SetVector("_ColorCropRegion", crop);
