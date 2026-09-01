@@ -53,16 +53,16 @@ void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
 
 
     // 2. COLOR: project direction into the passthrough sensor
-    float3 worldP = _AnchorPos + D;                                 // A point on the ray (camera origin, D) in world space 
-    float3 camSpace = mul(_ColorInvPose, float4(worldP, 1.0f)).xyz; // Convert to camera space 
+    float3 worldP = _AnchorPos + D;                                      // A point on the ray (camera origin, D) in world space 
+    float3 camSpaceCoord = mul(_ColorInvPose, float4(worldP, 1.0f)).xyz; // Convert to camera space 
 
     // check it's in front of the camera -> only half the sphere is visible
-    if (camSpace.z > 1e-5f)  
+    if (camSpaceCoord.z > 1e-5f)  
     {
         // 2D pixel coordinates in color sensor space (perspective projection)
         float2 sensor_coord = float2(
-            (camSpace.x / camSpace.z) * _ColorFocal.x + _ColorPrincipal.x,
-            (camSpace.y / camSpace.z) * _ColorFocal.y + _ColorPrincipal.y);
+            (camSpaceCoord.x / camSpaceCoord.z) * _ColorFocal.x + _ColorPrincipal.x,
+            (camSpaceCoord.y / camSpaceCoord.z) * _ColorFocal.y + _ColorPrincipal.y);
         
         // normalize into the cropped sensor region (cropped region coord system)
         float2 vp = float2(
@@ -80,30 +80,30 @@ void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
     // 3. DEPTH: project direction into the depth camera space
     // Port of CalculateEnvironmentDepthOcclusion / SampleEnvironmentDepthLinear.
     // Slice 0 = left eye, matching the left color camera and reproj matrix [0].
-    float4 depth_clip_coord = mul(_EnvironmentDepthReprojectionMatrices[0], float4(D, 0.0f));
+    float4 ndcDepthCoord = mul(_EnvironmentDepthReprojectionMatrices[0], float4(D, 0.0f));
 
     // check it's in front of the camera -> only half the sphere is visible
-    if (depth_clip_coord.w > 1e-5f)
+    if (ndcDepthCoord.w > 1e-5f)
     {
         // normalized device coordinates: NDC [-1,1] → UV [0,1]
-        float2 dUV = (depth_clip_coord.xy / depth_clip_coord.w + 1.0f) * 0.5f;
+        float2 uvPos = (ndcDepthCoord.xy / ndcDepthCoord.w + 1.0f) * 0.5f; 
+        
 
         // check if it's inside the camera's view
-        if (dUV.x >= 0.0f && dUV.x <= 1.0f && dUV.y >= 0.0f && dUV.y <= 1.0f)
+        if (uvPos.x >= 0.0f && uvPos.x <= 1.0f && uvPos.y >= 0.0f && uvPos.y <= 1.0f)
         {
-            float dEye = _EnvironmentDepthTexture.SampleLevel(
-                sampler_EnvironmentDepthTexture, float3(dUV, 0.0f), 0).r;
-            
-            // Convert the depth from eye space to linear metric depth in meters.
-            float ndc = dEye * 2.0f - 1.0f;                                 // NDC [-1,1] = 2 * depth - 1
-            float denominator = ndc + _EnvironmentDepthZBufferParams.y;     // denominator = ndc + far
-            
-            // denominator == 0 happens at the far plane (ndc == 1, y == -1) -> skip.
+            float depth_eye_non_linear = _EnvironmentDepthTexture.SampleLevel(
+                sampler_EnvironmentDepthTexture, float3(uvPos, 0.0f), 0).r;
+
+            // Convert the depth from eye space to linear metric depth in meters
+            float ndcDepth = depth_eye_non_linear * 2.0f - 1.0f;                                    // convert to NDC [-1,1] = 2 * depth - 1
+            float denominator = ndcDepth + _EnvironmentDepthZBufferParams.y;                        // denominator = ndc + far
+
             if (abs(denominator) > 1e-6f)
             {
-                float linearDepth = (1.0f / denominator) * _EnvironmentDepthZBufferParams.x; // linear depth in meters = near / (ndc + far)
-                if (linearDepth > 0.0f && linearDepth < 9999.0f)
-                    _DepthEquirect[id.xy] = linearDepth;   // meters, newest wins
+                float depth_in_meters = (1.0f / denominator) * _EnvironmentDepthZBufferParams.x;    // linear depth in meters = near / (ndc + far)
+                if (depth_in_meters > 0.0f && depth_in_meters < 9999.0f)
+                    _DepthEquirect[id.xy] = depth_in_meters;   // meters, newest wins
             }
         }
     }
