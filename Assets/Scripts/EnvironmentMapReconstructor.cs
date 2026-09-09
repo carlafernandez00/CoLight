@@ -9,7 +9,7 @@ using UnityEngine.UI;
 ///
 /// Two aligned panoramas are produced (same layout, same texel = same direction):
 ///   - Color panorama : linear RGB, alpha channel 0 = not yet seen.
-///   - Depth panorama : linear metric depth (meters), 0 = not yet seen.
+///   - Depth panorama : radial distance from C,   0 = not yet seen.
 /// 
 /// Notice:
 ///   - Color and depth sensors are treated as ~coincident at the head for the depth
@@ -34,6 +34,14 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     [Range(1, 30)]
     [SerializeField] private int m_updateEveryNFrames = 1;
 
+    [Header("Scanning")]
+    [Tooltip("Warn if the user drifts more than this (meters) from C while scanning.")]
+    [SerializeField] private float m_scanDriftWarnMeters = 0.30f;
+
+    [Header("Status UI")]
+    [Tooltip("Label on the debug canvas. Shows scan/tracking state and drift.")]
+    [SerializeField] private TMPro.TMP_Text m_statusText;
+
     [Header("Debug preview (optional)")]
     [Tooltip("RawImage that shows the reconstructed color panorama directly.")]
     [SerializeField] private RawImage m_colorPreview;
@@ -49,48 +57,79 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     public RenderTexture DepthEquirect => _depthRT;
     /// <summary>True once the color camera is delivering frames and the maps exist.</summary>
     public bool IsReady { get; private set; }
+    /// <summary>World-space centre the panorama is anchored at (C). Valid once scanning starts.</summary>
+    public Vector3 MapCenter => _mapCenter;
+    /// <summary>How far the head has drifted from C during the scan, in meters. For UI.</summary>
+    public float ScanDrift { get; private set; }
+    /// <summary>Current lifecycle stage, for UI.</summary>
+    public bool IsScanning => _state == State.Scanning;
+    public bool IsTracking => _state == State.Tracking;
 
     // ── Internals ─────────────────────────────────────────────────────────────
+    private enum State { Idle, Scanning, Tracking }
+    private State _state = State.Idle;
     private RenderTexture _colorRT;
     private RenderTexture _depthRT;
-    private RenderTexture _depthDisplayRT;   // greyscale view of _depthRT for the canvas
+    private RenderTexture _colorDisplayRT;  
+    private RenderTexture _depthDisplayRT;  
+    private Material      _colorVizMat;
     private Material      _depthVizMat;
-    private int _kernel;
+    private ComputeBuffer _depthAccum;
+    private Vector3       _mapCenter;
+
+    private int _kernelScan, _kernelClear, _kernelScatter, _kernelResolve;
     private int _frameCounter;
 
     // Debug logging state — one-shot flags so we log transitions, not every frame.
     private bool _loggedWaiting, _loggedPlaying, _loggedFirstFrame, _loggedFirstDispatch, _loggedNullTex;
     private static readonly int MaxDepthID = Shader.PropertyToID("_MaxDepth");
 
-    private static readonly int ColorEquirectID  = Shader.PropertyToID("_ColorEquirect");
-    private static readonly int DepthEquirectID   = Shader.PropertyToID("_DepthEquirect");
-    private static readonly int ColorTexID        = Shader.PropertyToID("_ColorTex");
+    private static readonly int ColorEquirectID    = Shader.PropertyToID("_ColorEquirect");
+    private static readonly int DepthEquirectID    = Shader.PropertyToID("_DepthEquirect");
+    private static readonly int ColorTexID         = Shader.PropertyToID("_ColorTex");
     private static readonly int DepthTexGlobalName = Shader.PropertyToID("_EnvironmentDepthTexture");
-    private static readonly int ZBufferParamsID   = Shader.PropertyToID("_EnvironmentDepthZBufferParams");
+    private static readonly int ZBufferParamsID    = Shader.PropertyToID("_EnvironmentDepthZBufferParams");
+    private static readonly int DepthAccumID       = Shader.PropertyToID("_DepthAccumulation");
+     private static readonly int MapCenterID       = Shader.PropertyToID("_MapCenter");
+    private static readonly int CamPosID           = Shader.PropertyToID("_CameraPos");
+    private static readonly int DepthReprojInvID   = Shader.PropertyToID("_DepthReprojInverse");
 
 
     private void Awake()
     {
-#if UNITY_EDITOR
-        // Passthrough + depth are unavailable in the editor; keep the camera access
-        // component from erroring and disable this reconstructor.
-        if (m_cameraAccess != null) m_cameraAccess.enabled = false;
-        enabled = false;
-#endif
+    #if UNITY_EDITOR
+            // Passthrough + depth are unavailable in the editor; keep the camera access
+            // component from erroring and disable this reconstructor.
+            if (m_cameraAccess != null) m_cameraAccess.enabled = false;
+            enabled = false;
+    #endif
     }
 
     private void Start()
     {
-#if UNITY_EDITOR
-        return;
-#else
+    #if UNITY_EDITOR
+            return;
+    #else
         if (m_computeShader == null)
         {
             Debug.LogError("[EnvReconstruct] No compute shader assigned.");
             enabled = false;
             return;
         }
-        _kernel = m_computeShader.FindKernel("ReconstructEquirect");
+        _kernelScan = m_computeShader.FindKernel("ReconstructEquirect");
+        _kernelClear = m_computeShader.FindKernel("ClearDepthAccumulation");
+        _kernelScatter = m_computeShader.FindKernel("ObtainDepth");
+        _kernelResolve = m_computeShader.FindKernel("ResolveDepthAndColor");
+
+        // Material used to paint unseen texels (alpha 0) magenta in the color preview.
+        if (m_colorPreview != null)
+        {
+            var colorVizShader = Shader.Find("EquirectColorVisualize");
+            if (colorVizShader != null)
+                _colorVizMat = new Material(colorVizShader) { hideFlags = HideFlags.HideAndDontSave };
+            else
+                Debug.LogWarning("[EnvReconstruct] Shader 'EquirectColorVisualize' not found — color preview falls back to the raw panorama.");
+        }
 
         // Material used to turn the metric depth map into a viewable greyscale image.
         if (m_depthPreview != null)
@@ -103,12 +142,13 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         }
 
         CreatePanoramas();
-#endif
+        SetStatus("Ready. Press A to start scanning.", false);
+    #endif
     }
 
     private void CreatePanoramas()
     {
-        // enableRandomWrite false to allow writing at any texel
+        // enableRandomWrite true to allow writing at any texel
         _colorRT = new RenderTexture(m_width, m_height, 0, RenderTextureFormat.ARGBHalf)
         {
             enableRandomWrite = true,      
@@ -125,14 +165,31 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         };
         _depthRT.Create();
 
+        // Per-frame nim accumulator. Buffer rather than texture because InterlockedMin needs a uint UAV
+        _depthAccum = new ComputeBuffer(m_width * m_height, sizeof(uint));
+
         // Start empty (color = transparent black, depth = 0 = "unseen").
-        // ClearRT(_colorRT, Color.clear);
-        // TODO: Clean magenta preview
-        ClearRT(_colorRT, Color.magenta);
+        ClearRT(_colorRT, Color.clear);
         ClearRT(_depthRT, Color.clear);
 
-        // Color panorama can be shown directly
-        if (m_colorPreview != null) m_colorPreview.texture = _colorRT;
+        // Display texture for the color env.: unseen texels (alpha 0) read as magenta instead of transparent
+        if (m_colorPreview != null && _colorVizMat != null)
+        {
+            _colorDisplayRT = new RenderTexture(m_width, m_height, 0, RenderTextureFormat.ARGB32)
+            {
+                useMipMap = false,
+                name = "EnvColorEquirectDisplay"
+            };
+            _colorDisplayRT.Create();
+
+            // clear to magenta so the panel is visible on the canvas before the first dispatch
+            ClearRT(_colorDisplayRT, Color.magenta);   
+            m_colorPreview.texture = _colorDisplayRT;
+        }
+        else if (m_colorPreview != null)
+        {
+            m_colorPreview.texture = _colorRT;
+        }
 
         // Depth is metric meters -> it goes through a bluescale display texture updated each dispatch
         if (m_depthPreview != null && _depthVizMat != null)
@@ -143,6 +200,9 @@ public class EnvironmentMapReconstructor : MonoBehaviour
                 name = "EnvDepthEquirectDisplay"
             };
             _depthDisplayRT.Create();
+            
+            // Clear to black so the panel is visible on the canvas before the first dispatch
+            ClearRT(_depthDisplayRT, Color.black);
             m_depthPreview.texture = _depthDisplayRT;
         }
     }
@@ -155,12 +215,59 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         RenderTexture.active = prev;
     }
 
+    public void StartScanning()
+    {
+        if (m_cameraAccess == null || !m_cameraAccess.IsPlaying)
+        {
+            Debug.LogWarning("[EnvReconstruct] Cannot start scanning: camera not ready.");
+            SetStatus("Camera not ready (check camera permission). Press A again in a moment.", false);
+            return;
+        }
+        ResetMaps();
+    
+        _mapCenter = m_cameraAccess.GetCameraPose().position;
+        _state = State.Scanning;
+        ScanDrift = 0f;
+
+        SetStatus("Scanning started. Stand still and look around. Press A when done.");
+    }
+
+    public void FinishScanning()
+    {
+        if (_state != State.Scanning) 
+        {
+            Debug.LogWarning("[EnvReconstruct] Cannot finish scanning: not currently scanning.");
+            return;
+        }
+
+        _state = State.Tracking;
+        SetStatus("Scanning finished. Tracking! you can walk around now :)");
+    }
+    
+    private void SetStatus(string s, bool log = true)
+    {
+        if (log) Debug.Log($"[EnvReconstruct] {s}");
+        // Guard the assignment: this is called every frame while scanning/waiting and
+        // TMP rebuilds its mesh on every set, even when the string is unchanged.
+        if (m_statusText != null && m_statusText.text != s) m_statusText.text = s;
+    }
+
 
     private void Update()
     {
-#if UNITY_EDITOR
-        return;
-#else
+    #if UNITY_EDITOR
+            return;
+    #else
+        // click A on the right controller to start or finish scanning
+        if (OVRInput.GetDown(OVRInput.Button.One))
+        {
+            if (_state == State.Scanning) FinishScanning();
+            else if (_state == State.Idle) StartScanning();
+            else                           StartScanning();
+
+        }
+        if (_state == State.Idle) return;
+
         if (m_cameraAccess == null)
         {
             if (!_loggedNullTex) { Debug.LogError("[EnvReconstruct] m_cameraAccess is not assigned."); _loggedNullTex = true; }
@@ -171,6 +278,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         if (!m_cameraAccess.IsPlaying)
         {
             if (!_loggedWaiting) { Debug.Log("[EnvReconstruct] Waiting for PassthroughCameraAccess to start (IsPlaying = false) — check camera permission."); _loggedWaiting = true; }
+            SetStatus("Waiting for the passthrough camera… (check camera permission)", false);
             return;
         }
         if (!_loggedPlaying) { Debug.Log("[EnvReconstruct] PassthroughCameraAccess is PLAYING — camera started."); _loggedPlaying = true; }
@@ -180,6 +288,20 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         if (!_loggedFirstFrame) { Debug.Log($"[EnvReconstruct] First camera frame received (resolution {m_cameraAccess.CurrentResolution})."); _loggedFirstFrame = true; }
 
+        // Update the drift from the map center C (for UI)
+        if (_state == State.Scanning)
+        {
+            var camPos = m_cameraAccess.GetCameraPose().position;
+            ScanDrift = Vector3.Distance(camPos, _mapCenter);
+
+            if (ScanDrift > m_scanDriftWarnMeters)
+            {
+                SetStatus($"Move back to where you started — {ScanDrift:F2} m off. Press A when done.", false);
+            }
+            else
+                SetStatus($"Scanning: drift {ScanDrift:F2} m. Press A when done.", false);
+        }
+
         _frameCounter++;
         if (_frameCounter < m_updateEveryNFrames) return;
         _frameCounter = 0;
@@ -187,7 +309,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         Dispatch();
         if (!_loggedFirstDispatch) { Debug.Log("[EnvReconstruct] First Dispatch complete — panorama is accumulating coverage."); _loggedFirstDispatch = true; }
         IsReady = true;
-#endif
+    #endif
     }
 
     private void Dispatch()
@@ -230,6 +352,15 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         Matrix4x4 colorProjectionMatrix = K * invCameraPose;
 
+        // Inverse of the depth reprojection matrix (from EnvironmentDepth API) 
+        Matrix4x4[] depthReprojMatrices = Shader.GetGlobalMatrixArray("_EnvironmentDepthReprojectionMatrices");
+        if (depthReprojMatrices == null || depthReprojMatrices.Length < 1)
+        {
+            Debug.LogWarning("[EnvReconstruct] No depth reprojection matrices found in shader globals — skipping this frame.");
+            return;
+        }
+        Matrix4x4 depthReprojInv = depthReprojMatrices[0].inverse;
+
         // BIND EVERYTHING
         m_computeShader.SetInt("_OutWidth",  m_width);
         m_computeShader.SetInt("_OutHeight", m_height);
@@ -238,20 +369,60 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         m_computeShader.SetVector("_ColorFocal",     intr.FocalLength);
         m_computeShader.SetVector("_ColorPrincipal", intr.PrincipalPoint);
         m_computeShader.SetVector("_ColorCropRegion", crop);
-        m_computeShader.SetVector("_AnchorPos", pose.position);
 
-        m_computeShader.SetTexture(_kernel, ColorTexID, colorTex);
-        m_computeShader.SetTexture(_kernel, ColorEquirectID, _colorRT);
-        m_computeShader.SetTexture(_kernel, DepthEquirectID, _depthRT);
+        m_computeShader.SetVector(MapCenterID, _mapCenter);
+        m_computeShader.SetVector(CamPosID, pose.position);
+        m_computeShader.SetMatrix(DepthReprojInvID, depthReprojInv);
+        m_computeShader.SetVector("_CamForward", pose.rotation * Vector3.forward);
 
-        // depth texture and parms come from Meta global 
-        m_computeShader.SetTextureFromGlobal(_kernel, DepthTexGlobalName, DepthTexGlobalName);
+        // depth params from Meta Global
         m_computeShader.SetVector(ZBufferParamsID, Shader.GetGlobalVector(ZBufferParamsID));
 
         // devide into groups of 8x8 threads (matches NUM_THREADS in the compute shader)
         int groupsX = Mathf.CeilToInt(m_width  / 8f);
         int groupsY = Mathf.CeilToInt(m_height / 8f);
-        m_computeShader.Dispatch(_kernel, groupsX, groupsY, 1);
+
+        // Scanning mode
+        if (_state == State.Scanning)
+        {
+            m_computeShader.SetTexture(_kernelScan, ColorTexID, colorTex);
+            m_computeShader.SetTexture(_kernelScan, ColorEquirectID, _colorRT);
+            m_computeShader.SetTexture(_kernelScan, DepthEquirectID, _depthRT);
+            
+            // depth texture from Meta global 
+            m_computeShader.SetTextureFromGlobal(_kernelScan, DepthTexGlobalName, DepthTexGlobalName);
+
+
+            m_computeShader.Dispatch(_kernelScan, groupsX, groupsY, 1);
+        }
+        // Tracking mode
+        else
+        {
+            // step 0: clear per-frame accumulator
+            m_computeShader.SetBuffer(_kernelClear, DepthAccumID, _depthAccum);
+            m_computeShader.Dispatch(_kernelClear, groupsX, groupsY, 1);
+
+            // step 1: scatter. reproject each stored point, InterlockedMin the result
+            m_computeShader.SetTexture(_kernelScatter, DepthEquirectID, _depthRT);
+            m_computeShader.SetTextureFromGlobal(_kernelScatter, DepthTexGlobalName, DepthTexGlobalName);
+            m_computeShader.SetBuffer(_kernelScatter, DepthAccumID, _depthAccum);
+
+            m_computeShader.Dispatch(_kernelScatter, groupsX, groupsY, 1);
+
+            // step 2: resolve. update the winning depth and gather colour from it
+            m_computeShader.SetTexture(_kernelResolve, ColorTexID, colorTex);
+            m_computeShader.SetTexture(_kernelResolve, ColorEquirectID, _colorRT);
+            m_computeShader.SetTexture(_kernelResolve, DepthEquirectID, _depthRT);
+            m_computeShader.SetBuffer(_kernelResolve, DepthAccumID, _depthAccum);
+
+            m_computeShader.Dispatch(_kernelResolve, groupsX, groupsY, 1);
+
+        }
+        
+
+        // Refresh the color preview from the updated panorama (unseen -> magenta)
+        if (_colorDisplayRT != null && _colorVizMat != null)
+            Graphics.Blit(_colorRT, _colorDisplayRT, _colorVizMat);
 
         // Refresh the greyscale depth preview from the updated metric depth map
         if (_depthDisplayRT != null && _depthVizMat != null)
@@ -266,13 +437,24 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     {
         if (_colorRT != null) ClearRT(_colorRT, Color.clear);
         if (_depthRT != null) ClearRT(_depthRT, Color.clear);
+
+        // Reset the previews too, or a rescan keeps showing the previous scan until
+        // the next dispatch lands.
+        if (_colorDisplayRT != null) ClearRT(_colorDisplayRT, Color.magenta);
+        if (_depthDisplayRT != null) ClearRT(_depthDisplayRT, Color.black);
+
+        _state = State.Idle;
+        IsReady = false;
     }
 
     private void OnDestroy()
     {
         if (_colorRT != null) { _colorRT.Release(); Destroy(_colorRT); }
         if (_depthRT != null) { _depthRT.Release(); Destroy(_depthRT); }
+        if (_colorDisplayRT != null) { _colorDisplayRT.Release(); Destroy(_colorDisplayRT); }
         if (_depthDisplayRT != null) { _depthDisplayRT.Release(); Destroy(_depthDisplayRT); }
+        if (_colorVizMat != null) Destroy(_colorVizMat);
         if (_depthVizMat != null) Destroy(_depthVizMat);
+        if (_depthAccum != null) { _depthAccum.Release(); _depthAccum = null; }
     }
 }
