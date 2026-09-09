@@ -3,7 +3,11 @@ using System.Diagnostics;
 using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
+using System;                 
+using System.Text;            
+using System.Globalization;   
 using Debug = UnityEngine.Debug;
+using Object = UnityEngine.Object;
 
 /// <summary>
 /// Projects the scene's Skybox/Panoramic environment map to L2 Spherical Harmonics
@@ -38,9 +42,19 @@ public class EnvironmentSHUpdater : MonoBehaviour
         ImportanceSampling   // Monte Carlo sampling of a luminance distribution (cost fixed by sample count)
     }
 
+    public enum ImportanceFunction
+    {
+        Luminance,           // Importance = max(dot(color, LUMA), 0) : Rec.709 luminance
+        ColorAware,          // Importance = max(max(color.r, color.g), color.b)
+        Uniform              // Importance = 1 (no weighting)
+    }
+
     [Header("Projection method")]
     [Tooltip("FullScan visits every texel. ImportanceSampling draws numSamples from a luminance-weighted distribution.")]
     public ProjectionMethod method = ProjectionMethod.FullScan;
+
+    [Tooltip("Importance function used to build the sampling distribution (ImportanceSampling only).")]
+    public ImportanceFunction importanceFunction = ImportanceFunction.Luminance;
 
     [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
     public int numSamples = 2048;
@@ -51,6 +65,13 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
     [Tooltip("Which probe to visualize/save. 0 = ambient probe (world origin); 1..N = baked probes.")]
     public int debugProbeIndex = 0;
+
+    [Header("Debug importance sampling")]
+    [Tooltip("Save information to visualize the distribution of the importance function.")]
+    public bool debugImportanceSampling = false;
+
+    [Tooltip("Write the dump only on the first update, then stop (avoids rewriting the same files every N frames).")]
+    public bool dumpOnce = true; 
 
     // Internal
     private ComputeBuffer _shBuffer;
@@ -71,6 +92,16 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private ComputeBuffer _marginalCdfBuffer;  // mipH + 1 floats
     private ComputeBuffer _marginalFuncBuffer; // mipH floats
     private int           _distW, _distH;      // dims the distribution buffers were built for
+
+    // Debug Importance Sampling
+    private ComputeBuffer _sampleCountBuffer;  // mipW * mipH uints, counts how many times each texel was sampled
+    private ComputeBuffer _importanceMapBuffer; // mipW * mipH floats, stores the importance function value for each texel
+    private uint[]        _sampleCountRaw;
+    private uint[]        _sampleCountZeros;
+    private float[]       _importanceRaw;
+    private int           _dumpW, _dumpH;
+    private bool          _sampleDumpWritten;   
+
 
     // Known property names used by Unity's Skybox/Panoramic shader
     private static readonly string[] _skyboxTexProperties = { "_MainTex", "_Tex", "_SkyTex" };
@@ -104,16 +135,18 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _kernelBuildMarg = computeShader.FindKernel("BuildMarginalCDF");
         EnsureBuffer(1); // at minimum one slot for the ambient probe
 
+        _sampleDumpWritten = false; 
+
         // Profiling log setup.
         // Editor: project-relative Debug folder (easy to find in Finder).
         // Device: persistentDataPath is the only writable location on Android/Quest.
-#if UNITY_EDITOR
-        _profileLogPath = Path.Combine(Application.dataPath, "Debug", "Profiling", "SHProfiler.csv");
-#else
-        _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
-#endif
+        #if UNITY_EDITOR
+                _profileLogPath = Path.Combine(Application.dataPath, "Debug", "Profiling", "SHProfiler.csv");
+        #else
+                _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
+        #endif
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
-        File.WriteAllText(_profileLogPath, "frame,method,probeCount,samples,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
+        File.WriteAllText(_profileLogPath, "frame,method,importance,probeCount,samples,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
 
         // Create a detached LightProbes clone and make it the active probe set.
@@ -134,6 +167,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _marginalCdfBuffer?.Release();  _marginalCdfBuffer  = null;
         _marginalFuncBuffer?.Release(); _marginalFuncBuffer = null;
         _distW = _distH = 0;
+
+        _sampleCountBuffer?.Release();  _sampleCountBuffer  = null;
+        _importanceMapBuffer?.Release(); _importanceMapBuffer = null;
+        _dumpW = _dumpH = 0;
 
         if (_diffuseRenderTexture != null) { _diffuseRenderTexture.Release(); _diffuseRenderTexture = null; }
     }
@@ -187,6 +224,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _currentEnvTex = tex;
         UpdateSH();
     }
+
+    /// <summary>
+    /// Re-arms the sample dump so the next update writes the files again
+    /// (useful after switching importanceFunction or numSamples at runtime).
+    /// </summary>
+    public void ResetSampleDump() => _sampleDumpWritten = false;
 
     // -----------------------------------------------------------------------
     // Skybox texture fetch
@@ -270,6 +313,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // bakedCount + 1 : slot 0 reserved for ambient probe
         EnsureBuffer(bakedCount + 1);
 
+        bool saveSampleDump = debugImportanceSampling && method == ProjectionMethod.ImportanceSampling 
+                                                      && !(dumpOnce && _sampleDumpWritten);
+
         _swTotal.Restart(); // reset + start
 
         // Select the kernel for this update
@@ -281,7 +327,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetFloat ("_EnvSphereRadius", envSphereRadius);
         computeShader.SetInt   ("_MipLevel",        mipLevel);
         computeShader.SetInt   ("_NumSamples",      numSamples);
-        computeShader.SetInt   ("_DebugProbeIndex", debugDiffuseMap ? debugProbeIndex : -1);
+        computeShader.SetInt   ("_ImportanceFunction", (int)importanceFunction);
+        computeShader.SetInt   ("_DebugProbeIndex", (debugDiffuseMap || saveSampleDump) ? debugProbeIndex : -1);
+
+        if (saveSampleDump) computeShader.EnableKeyword("DEBUG_IMPORTANCE_SAMPLING");
+        else                computeShader.DisableKeyword("DEBUG_IMPORTANCE_SAMPLING");
+
 
         // 1a. Importance sampling: build the luminance distribution ONCE.
         // It depends only on the env map, so all probes reuse it.
@@ -291,6 +342,15 @@ public class EnvironmentSHUpdater : MonoBehaviour
             int mipW = Mathf.Max(1, _currentEnvTex.width  >> mipLevel);
             int mipH = Mathf.Max(1, _currentEnvTex.height >> mipLevel);
             EnsureDistributionBuffers(mipW, mipH);
+            
+            if (saveSampleDump)
+            {
+                EnsureSampleDumpBuffers(mipW, mipH);
+                _sampleCountBuffer.SetData(_sampleCountZeros);     // reset hits per texel
+
+                computeShader.SetBuffer(_activeKernel, "_SampleCount", _sampleCountBuffer);
+                computeShader.SetBuffer(_kernelBuildCond, "_ImportanceMap", _importanceMapBuffer);
+            } 
 
             _swBuild.Start();
             BuildLuminanceDistribution(mipW, mipH);
@@ -305,10 +365,6 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetTexture(_activeKernel, "_EquirectMap", _currentEnvTex);
         computeShader.SetBuffer (_activeKernel, "_SHCoeffs",    _shBuffer);
 
-        // 1c. Bind the debug map to the active kernel
-        // sized to match the env map. _OutWidth/_OutHeight = 0 disables the pass.
-        // The DEBUG_DIFFUSE_MAP keyword compiles the debug paint in/out entirely, so
-        // profiling runs (debug off) use a kernel with no debug code — zero cost.
         if (debugDiffuseMap) computeShader.EnableKeyword("DEBUG_DIFFUSE_MAP");
         else                 computeShader.DisableKeyword("DEBUG_DIFFUSE_MAP");
 
@@ -367,19 +423,27 @@ public class EnvironmentSHUpdater : MonoBehaviour
         double readbackS = _swReadback.Elapsed.TotalSeconds;
         double totalS    = _swTotal.Elapsed.TotalSeconds;
         int    samples   = (method == ProjectionMethod.ImportanceSampling) ? numSamples : 0;
+        string impFunc   = (method == ProjectionMethod.ImportanceSampling) ? importanceFunction.ToString() : "N/A";
 
-        Debug.Log($"[EnvironmentSHUpdater] SH updated ({method}) — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
+        Debug.Log($"[EnvironmentSHUpdater] SH updated ({method}/{impFunc}) — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
                   $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
 
         // InvariantCulture forces '.' as the decimal separator; on Quest the device
         // locale may default to ',', which would corrupt the CSV columns.
         File.AppendAllText(_profileLogPath, string.Format(System.Globalization.CultureInfo.InvariantCulture,
-            "{0},{1},{2},{3},{4},{5:F6},{6:F6},{7:F6},{8:F6}\n",
-            Time.frameCount, method, bakedCount + 1, samples, mipLevel, buildS, dispatchS, readbackS, totalS));
+            "{0},{1},{2},{3},{4},{5},{6:F6},{7:F6},{8:F6},{9:F6}\n",
+            Time.frameCount, method, impFunc, bakedCount + 1, samples, mipLevel, buildS, dispatchS, readbackS, totalS));
 
-        // 8. Dump the debug map to disk (both methods write it now)
+        // 8. Dump the debug map to disk
         if (debugDiffuseMap)
             SaveDiffuseMapToDisk();
+        
+        // 9. Dump the importance sampling data to disk (texels + hit counts + importance map + env map)
+        if (saveSampleDump)
+        {
+            SaveSampleDumpToDisk();
+            _sampleDumpWritten = true;
+        }
     }
 
     private void DispatchForProbe(int probeIndex, Vector3 position)
@@ -433,11 +497,11 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.png";
         string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.exr";
 
-#if UNITY_EDITOR
-        string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
-#else
-        string dir = Path.Combine(Application.persistentDataPath, "SHProbe");
-#endif
+        #if UNITY_EDITOR
+                string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
+        #else
+                string dir = Path.Combine(Application.persistentDataPath, "SHProbe");
+        #endif
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, fileName);
 
@@ -445,6 +509,111 @@ public class EnvironmentSHUpdater : MonoBehaviour
         File.WriteAllBytes(path, exr);
         Debug.Log($"[EnvironmentSHUpdater] Debug map saved: {path}");
     }
+
+    // Saves the importance sampling data to disk for visualization/debugging. Writes the following files:
+    //   Samples_<imp>_N<n>_mip<m>_<W>x<H>.csv    x,y,u,v,count,importance   (only texels with count > 0)
+    //   Importance_<imp>_mip<m>_<W>x<H>.f32      W*H float32,               (greyscale importance map)
+    //   Dump_<imp>_N<n>_mip<m>.json              metadata + the file names above
+    //
+    // Row order matches Unity UV space: index = y*W + x with u = (x+0.5)/W, v = (y+0.5)/H,
+    // and v = 0 is the SOUTH pole -> row 0 is the BOTTOM image row (matplotlib: origin='lower').
+    private void SaveSampleDumpToDisk()
+    {
+        if (_sampleCountBuffer == null || _dumpW <= 0 || _dumpH <= 0) return;
+ 
+        int W = _dumpW, H = _dumpH;
+ 
+        _sampleCountBuffer.GetData(_sampleCountRaw);
+        _importanceMapBuffer.GetData(_importanceRaw);
+ 
+        #if UNITY_EDITOR
+                string dir = Path.Combine(Application.dataPath, "Debug", "SH_ImportanceSamples");
+        #else
+                string dir = Path.Combine(Application.persistentDataPath, "SH_ImportanceSamples");
+        #endif
+        Directory.CreateDirectory(dir);
+ 
+        var    ic  = CultureInfo.InvariantCulture;
+        string tag = $"{importanceFunction}_N{numSamples}_mip{mipLevel}_{W}x{H}";
+ 
+        // 1. sampled texels: position, hit count, importance value
+        string samplesFile = $"Samples_{tag}.csv";
+        var    sb          = new StringBuilder(1 << 16);
+        sb.Append("x,y,u,v,count,importance\n");
+ 
+        long totalHits    = 0;
+        int  uniqueTexels = 0;
+        uint maxCount     = 0;
+        for (int y = 0; y < H; y++)
+        {
+            int row = y * W;
+            for (int x = 0; x < W; x++)
+            {
+                uint cnt = _sampleCountRaw[row + x];
+                if (cnt == 0) continue;
+ 
+                uniqueTexels++;
+                totalHits += cnt;
+                if (cnt > maxCount) maxCount = cnt;
+ 
+                float u = (x + 0.5f) / W;
+                float v = (y + 0.5f) / H;
+                sb.AppendFormat(ic, "{0},{1},{2:F6},{3:F6},{4},{5:G9}\n",
+                                x, y, u, v, cnt, _importanceRaw[row + x]);
+            }
+        }
+        File.WriteAllText(Path.Combine(dir, samplesFile), sb.ToString());
+ 
+        // 2. greyscale importance map (raw float32, W*H) 
+        string impFile   = $"Importance_{tag}.f32";
+        var    impBytes  = new byte[W * H * sizeof(float)];
+        Buffer.BlockCopy(_importanceRaw, 0, impBytes, 0, impBytes.Length);
+        File.WriteAllBytes(Path.Combine(dir, impFile), impBytes);
+ 
+        // 3. metadata 
+        string metaFile = $"Dump_{importanceFunction}_N{numSamples}_mip{mipLevel}.json";
+        var    meta     = new StringBuilder();
+        meta.Append("{\n");
+        meta.AppendFormat(ic, "  \"importanceFunction\": \"{0}\",\n", importanceFunction);
+        meta.AppendFormat(ic, "  \"importanceMode\": {0},\n",         (int)importanceFunction);
+        meta.AppendFormat(ic, "  \"numSamples\": {0},\n",             numSamples);
+        meta.AppendFormat(ic, "  \"mipLevel\": {0},\n",               mipLevel);
+        meta.AppendFormat(ic, "  \"width\": {0},\n",                  W);
+        meta.AppendFormat(ic, "  \"height\": {0},\n",                 H);
+        meta.AppendFormat(ic, "  \"texWidth\": {0},\n",               _currentEnvTex.width);
+        meta.AppendFormat(ic, "  \"texHeight\": {0},\n",              _currentEnvTex.height);
+        meta.AppendFormat(ic, "  \"probeIndex\": {0},\n",             debugProbeIndex);
+        meta.AppendFormat(ic, "  \"envSphereRadius\": {0:G9},\n",     envSphereRadius);
+        meta.AppendFormat(ic, "  \"uniqueTexels\": {0},\n",           uniqueTexels);
+        meta.AppendFormat(ic, "  \"totalHits\": {0},\n",              totalHits);
+        meta.AppendFormat(ic, "  \"maxCount\": {0},\n",               maxCount);
+        meta.Append       (    "  \"rowMajor\": true,\n");
+        meta.Append       (    "  \"uvConvention\": \"u=(x+0.5)/W, v=(y+0.5)/H, v=0 is the south pole (bottom row)\",\n");
+        meta.AppendFormat(ic, "  \"samplesFile\": \"{0}\",\n",        samplesFile);
+        meta.AppendFormat(ic, "  \"importanceFile\": \"{0}\"\n",      impFile);
+        meta.Append("}\n");
+        File.WriteAllText(Path.Combine(dir, metaFile), meta.ToString());
+    }
+ 
+    // Sizes the sample-dump buffers to the mip dimensions and only rebuilds when they change.
+    private void EnsureSampleDumpBuffers(int mipW, int mipH)
+    {
+        if (_sampleCountBuffer != null && _dumpW == mipW && _dumpH == mipH) return;
+ 
+        _sampleCountBuffer?.Release();
+        _importanceMapBuffer?.Release();
+ 
+        int n = mipW * mipH;
+        _sampleCountBuffer   = new ComputeBuffer(n, sizeof(uint));
+        _importanceMapBuffer = new ComputeBuffer(n, sizeof(float));
+ 
+        _sampleCountRaw   = new uint[n];
+        _sampleCountZeros = new uint[n];          // cached zero-fill used to clear the histogram
+        _importanceRaw    = new float[n];
+        _dumpW = mipW;
+        _dumpH = mipH;
+    }
+
 
     // Builds the PBRT-style Distribution2D (luminance × sinθ) for the current
     // env map at the active mip level. Two passes: per-row conditional CDFs
