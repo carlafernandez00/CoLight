@@ -8,8 +8,8 @@
 #pragma kernel BuildConditionalCDF        // Build per-row conditional CDF (u | v) + row integrals
 #pragma kernel BuildMarginalCDF           // Fold row integrals into the marginal CDF (v)
 
-// Debug diffuse-map paint is compiled in ONLY when DEBUG_DIFFUSE_MAP
-#pragma multi_compile _ DEBUG_DIFFUSE_MAP
+#pragma multi_compile _ DEBUG_DIFFUSE_MAP           // Debug diffuse-map paint is compiled in ONLY when DEBUG_DIFFUSE_MAP
+#pragma multi_compile _ DEBUG_IMPORTANCE_SAMPLING   // Debug importance sampling distribution is compiled in ONLY when DEBUG_IMPORTANCE_SAMPLING
 
 // INPUTS 
 Texture2D<float4>   _EquirectMap;           // Equirectangular environment map (Skybox/Panoramic texture)
@@ -21,6 +21,7 @@ float3              _ProbePosition;         // World-space position of the probe
 float               _EnvSphereRadius;       // Radius of the virtual environment sphere (scene scale)
 int                 _ProbeIndex;            // Probe slot: coefficients written at [_ProbeIndex*9 + i]
 int                 _NumSamples;            // (Importance sampling only) number of Monte Carlo samples per probe
+int                 _ImportanceFunction;    // (Importance sampling only) 0 = luminance, 1 = color aware, 2 = uniform (weight 1)  
 
 // OUTPUT
 // 9 SH coefficients per probe, one float3 (RGB) per coefficient -> buffer must have (_ProbeIndex + 1) * 9 elements
@@ -31,6 +32,12 @@ RWTexture2D<float4> _DiffuseMap;
 int _OutWidth;          // width  of _DiffuseMap (0 = disabled)
 int _OutHeight;         // height of _DiffuseMap (0 = disabled)
 int _DebugProbeIndex;   // probe for which the debug map is written 
+
+// DEBUG IMPORTANCE SAMPLING DISTRIBUTION (optional)
+#ifdef DEBUG_IMPORTANCE_SAMPLING
+RWStructuredBuffer<uint>   _SampleCount;     // how many times each texel was picked
+RWStructuredBuffer<float>  _ImportanceMap;   // importance function value per texel
+#endif
 
 // LUMINANCE DISTRIBUTION (importance sampling)
 // PBRT-style piecewise-constant Distribution2D over the (u,v) unit square,
@@ -63,6 +70,12 @@ float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }        
 
 // Rec.709 luminance weights
 #define LUMA float3(0.2126f, 0.7152f, 0.0722f)
+
+// Importance function modes
+#define IMPORTANCE_LUMINANCE 0
+#define IMPORTANCE_COLOR     1
+#define IMPORTANCE_UNIFORM   2
+
 
 // Lambertian Convolution - radiance SH -> diffuse response 
 // Ramamoorthi & Hanrahan 2001 zonal factors divided through by A0
@@ -197,38 +210,46 @@ void ProjectEquirectToSH(uint3 groupID : SV_GroupID, uint threadIndex : SV_Group
     [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[base + i] = gSH[0][i];
 
     // when DEBUG_DIFFUSE_MAP, write the SH coefficients just computed for the ambient probe into _DiffuseMap
-#ifdef DEBUG_DIFFUSE_MAP
-    if (_ProbeIndex == _DebugProbeIndex)
-    {
-        int total = _OutWidth * _OutHeight;
-        for (int p = 0; p < total; p++)
+    #ifdef DEBUG_DIFFUSE_MAP
+        if (_ProbeIndex == _DebugProbeIndex)
         {
-            int   px = p % _OutWidth;
-            int   py = p / _OutWidth;
-            float u  = (px + 0.5f) / (float)_OutWidth;
-            float v  = (py + 0.5f) / (float)_OutHeight;
-            float3 n = DirFromUV(u, v);
+            int total = _OutWidth * _OutHeight;
+            for (int p = 0; p < total; p++)
+            {
+                int   px = p % _OutWidth;
+                int   py = p / _OutWidth;
+                float u  = (px + 0.5f) / (float)_OutWidth;
+                float v  = (py + 0.5f) / (float)_OutHeight;
+                float3 n = DirFromUV(u, v);
 
-            float3 c = gSH[0][0] * SH_Y00()
-                     + gSH[0][1] * SH_Y1n1(n)
-                     + gSH[0][2] * SH_Y10 (n)
-                     + gSH[0][3] * SH_Y1p1(n)
-                     + gSH[0][4] * SH_Y2n2(n)
-                     + gSH[0][5] * SH_Y2n1(n)
-                     + gSH[0][6] * SH_Y20 (n)
-                     + gSH[0][7] * SH_Y2p1(n)
-                     + gSH[0][8] * SH_Y2p2(n);
+                float3 c = gSH[0][0] * SH_Y00()
+                        + gSH[0][1] * SH_Y1n1(n)
+                        + gSH[0][2] * SH_Y10 (n)
+                        + gSH[0][3] * SH_Y1p1(n)
+                        + gSH[0][4] * SH_Y2n2(n)
+                        + gSH[0][5] * SH_Y2n1(n)
+                        + gSH[0][6] * SH_Y20 (n)
+                        + gSH[0][7] * SH_Y2p1(n)
+                        + gSH[0][8] * SH_Y2p2(n);
 
-            _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+                _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+            }
         }
-    }
-#endif // DEBUG_DIFFUSE_MAP
+    #endif // DEBUG_DIFFUSE_MAP
 }
 
 // ===========================================================================
 // Distribution build kernels (importance sampling)
 // Run ONCE per environment map, before the per-probe sampling dispatches.
 // ===========================================================================
+
+// Importance function: luminance, color-aware, or uniform (weight 1)
+float ImportanceValue(float3 color)
+{
+    if (_ImportanceFunction == IMPORTANCE_LUMINANCE) return max(dot(color, LUMA), 0.0f); 
+    else if (_ImportanceFunction == IMPORTANCE_COLOR) return max(max(color.r, color.g), color.b); 
+    else return 1.0f;                           
+}
 
 // One thread per row y. Walks that row along u, accumulating importance
 // (luminance * sinθ) into an un-normalized running sum, then normalizes it to
@@ -253,11 +274,16 @@ void BuildConditionalCDF(uint3 id : SV_DispatchThreadID)
     {
         float  u    = (x + 0.5f) / (float)W;
         float3 c    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;
-        float  func = max(dot(c, LUMA), 0.0f) * sinTheta;   // importance = luminance · sinθ (corrects for equirectangular distortion, so bright regions and poles are both handled)
-        // float func = max(max(c.r, c.g), c.b) * sinTheta;       // color aware
+        float  imp  = ImportanceValue(c);
+        float  func = imp * sinTheta;   // importance = luminance · sinθ (corrects for equirectangular distortion, so bright regions and poles are both handled)
 
         acc += func;
         _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
+        
+        // DEBUG IMPORTANCE SAMPLING: store the importance function value for each texel
+        #ifdef DEBUG_IMPORTANCE_SAMPLING
+            _ImportanceMap[y * W + x] = imp;
+        #endif
     }
 
     _MarginalFunc[y] = acc;                                  // row integral (drives marginal)
@@ -396,6 +422,10 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         float v      = (y + 0.5) / (float)H;
         float u      = (x + 0.5) / (float)W;
 
+        #ifdef DEBUG_IMPORTANCE_SAMPLING
+            if (_ProbeIndex == _DebugProbeIndex)
+                InterlockedAdd(_SampleCount[y * W + x], 1u);     // count how many times this texel was picked
+        #endif
 
         // 3: UV → spherical angles  with Y-up 
         float phi      = (u - 0.5f) * 2.0f * PI;
@@ -463,30 +493,30 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     
 
     // when DEBUG_DIFFUSE_MAP, write the SH coefficients just computed for the ambient probe into _DiffuseMap
-#ifdef DEBUG_DIFFUSE_MAP
-    if (_ProbeIndex == _DebugProbeIndex)
-    {
-        int total = _OutWidth * _OutHeight;
-        for (int p = (int)threadIndex; p < total; p += NUM_THREADS)
+    #ifdef DEBUG_DIFFUSE_MAP
+        if (_ProbeIndex == _DebugProbeIndex)
         {
-            int   px = p % _OutWidth;
-            int   py = p / _OutWidth;
-            float u  = (px + 0.5f) / (float)_OutWidth;
-            float v  = (py + 0.5f) / (float)_OutHeight;
-            float3 n = DirFromUV(u, v);
+            int total = _OutWidth * _OutHeight;
+            for (int p = (int)threadIndex; p < total; p += NUM_THREADS)
+            {
+                int   px = p % _OutWidth;
+                int   py = p / _OutWidth;
+                float u  = (px + 0.5f) / (float)_OutWidth;
+                float v  = (py + 0.5f) / (float)_OutHeight;
+                float3 n = DirFromUV(u, v);
 
-            float3 c = gSH[0][0] * SH_Y00()
-                     + gSH[0][1] * SH_Y1n1(n)
-                     + gSH[0][2] * SH_Y10 (n)
-                     + gSH[0][3] * SH_Y1p1(n)
-                     + gSH[0][4] * SH_Y2n2(n)
-                     + gSH[0][5] * SH_Y2n1(n)
-                     + gSH[0][6] * SH_Y20 (n)
-                     + gSH[0][7] * SH_Y2p1(n)
-                     + gSH[0][8] * SH_Y2p2(n);
+                float3 c = gSH[0][0] * SH_Y00()
+                        + gSH[0][1] * SH_Y1n1(n)
+                        + gSH[0][2] * SH_Y10 (n)
+                        + gSH[0][3] * SH_Y1p1(n)
+                        + gSH[0][4] * SH_Y2n2(n)
+                        + gSH[0][5] * SH_Y2n1(n)
+                        + gSH[0][6] * SH_Y20 (n)
+                        + gSH[0][7] * SH_Y2p1(n)
+                        + gSH[0][8] * SH_Y2p2(n);
 
-            _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+                _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+            }
         }
-    }
-#endif // DEBUG_DIFFUSE_MAP
+    #endif // DEBUG_DIFFUSE_MAP
 }
