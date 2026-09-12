@@ -27,7 +27,7 @@ Shader "EquirectDepthVisualize"
             #include "UnityCG.cginc"
 
             sampler2D _MainTex;
-            float _MaxDepth;  // max depth (meters) mapped to black -> used to scale the data
+            float _MaxDepth; 
 
             fixed4 frag(v2f_img i) : SV_Target
             {

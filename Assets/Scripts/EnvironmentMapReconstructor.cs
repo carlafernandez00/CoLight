@@ -1,5 +1,6 @@
 using Meta.XR;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
 
 /// <summary>
@@ -16,6 +17,9 @@ using UnityEngine.UI;
 ///     projection (they differ by a few cm of lens offset).
 ///   - Not available in the Unity Editor (needs passthrough + depth on device).
 /// </summary>
+
+// Depth data instead of previous frame -> sync immediately before the camera renders the frame
+[BeforeRenderOrder(100)]
 public class EnvironmentMapReconstructor : MonoBehaviour
 {
     [Header("References")]
@@ -47,7 +51,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     [SerializeField] private RawImage m_colorPreview;
     [Tooltip("RawImage that shows the depth panorama as greyscale (near = white, unseen = blue).")]
     [SerializeField] private RawImage m_depthPreview;
-    [Tooltip("Depth (m) mapped to black in the depth preview. Nearer values are brighter.")]
+    [Tooltip("Fallback depth (m) mapped to black in the depth preview, used until the first measured range arrives.")]
     [SerializeField] private float m_depthPreviewMaxMeters = 4f;
 
     // ── Public outputs ────────────────────────────────────────────────────────
@@ -75,10 +79,16 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private Material      _colorVizMat;
     private Material      _depthVizMat;
     private ComputeBuffer _depthAccum;
+    private ComputeBuffer _depthRange;
     private Vector3       _mapCenter;
 
-    private int _kernelScan, _kernelClear, _kernelScatter, _kernelResolve;
+    private static readonly uint[] DepthRangeReset = { 0u, 0u };   // min = sentinel, max = 0
+    private AsyncGPUReadbackRequest? _depthRangeRequest;
+    private float _measuredMaxDepth;                                // 0 = nothing measured yet, fall back to m_depthPreviewMaxMeters
+
+    private int _kernelScan, _kernelClear, _kernelScatter, _kernelResolve, _kernelRange;
     private int _frameCounter;
+    private bool _dispatchPending;   // Update() decides, OnBeforeRender() dispatches (see [BeforeRenderOrder])
 
     // Debug logging state — one-shot flags so we log transitions, not every frame.
     private bool _loggedWaiting, _loggedPlaying, _loggedFirstFrame, _loggedFirstDispatch, _loggedNullTex;
@@ -90,8 +100,11 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private static readonly int DepthTexGlobalName = Shader.PropertyToID("_EnvironmentDepthTexture");
     private static readonly int ZBufferParamsID    = Shader.PropertyToID("_EnvironmentDepthZBufferParams");
     private static readonly int DepthAccumID       = Shader.PropertyToID("_DepthAccumulation");
+    private static readonly int DepthRangeID       = Shader.PropertyToID("_DepthRange");
      private static readonly int MapCenterID       = Shader.PropertyToID("_MapCenter");
     private static readonly int CamPosID           = Shader.PropertyToID("_CameraPos");
+    private static readonly int DepthReprojGlobalID = Shader.PropertyToID("_EnvironmentDepthReprojectionMatrices");
+    private static readonly int DepthReprojID      = Shader.PropertyToID("_DepthReproj");
     private static readonly int DepthReprojInvID   = Shader.PropertyToID("_DepthReprojInverse");
 
 
@@ -102,6 +115,21 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             // component from erroring and disable this reconstructor.
             if (m_cameraAccess != null) m_cameraAccess.enabled = false;
             enabled = false;
+    #endif
+    }
+
+    private void OnEnable()
+    {
+    #if !UNITY_EDITOR
+        Application.onBeforeRender += OnBeforeRenderDispatch;
+    #endif
+    }
+
+    private void OnDisable()
+    {
+    #if !UNITY_EDITOR
+        Application.onBeforeRender -= OnBeforeRenderDispatch;
+        _dispatchPending = false;
     #endif
     }
 
@@ -120,6 +148,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         _kernelClear = m_computeShader.FindKernel("ClearDepthAccumulation");
         _kernelScatter = m_computeShader.FindKernel("ObtainDepth");
         _kernelResolve = m_computeShader.FindKernel("ResolveDepthAndColor");
+        _kernelRange = m_computeShader.FindKernel("ReduceDepthRange");
 
         // Material used to paint unseen texels (alpha 0) magenta in the color preview.
         if (m_colorPreview != null)
@@ -167,6 +196,9 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         // Per-frame nim accumulator. Buffer rather than texture because InterlockedMin needs a uint UAV
         _depthAccum = new ComputeBuffer(m_width * m_height, sizeof(uint));
+
+        // Two uints: measured min and max depth over the panorama, for the preview's range.
+        _depthRange = new ComputeBuffer(2, sizeof(uint));
 
         // Start empty (color = transparent black, depth = 0 = "unseen").
         ClearRT(_colorRT, Color.clear);
@@ -306,10 +338,22 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         if (_frameCounter < m_updateEveryNFrames) return;
         _frameCounter = 0;
 
+        // Defer the actual dispatch to OnBeforeRender as EnvironmentDepthManager has not yet
+        // published this frame's depth texture and reprojection matrices at Update time.
+        _dispatchPending = true;
+    #endif
+    }
+
+    // Runs in the same frame phase as EnvironmentDepthManager.OnBeforeRender but at a later
+    // order, so Shader.GetGlobalMatrixArray and the global depth texture are current-frame.
+    private void OnBeforeRenderDispatch()
+    {
+        if (!_dispatchPending) return;
+        _dispatchPending = false;
+
         Dispatch();
         if (!_loggedFirstDispatch) { Debug.Log("[EnvReconstruct] First Dispatch complete — panorama is accumulating coverage."); _loggedFirstDispatch = true; }
         IsReady = true;
-    #endif
     }
 
     private void Dispatch()
@@ -352,14 +396,11 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         Matrix4x4 colorProjectionMatrix = K * invCameraPose;
 
-        // Inverse of the depth reprojection matrix (from EnvironmentDepth API) 
-        Matrix4x4[] depthReprojMatrices = Shader.GetGlobalMatrixArray("_EnvironmentDepthReprojectionMatrices");
-        if (depthReprojMatrices == null || depthReprojMatrices.Length < 1)
-        {
-            Debug.LogWarning("[EnvReconstruct] No depth reprojection matrices found in shader globals — skipping this frame.");
-            return;
-        }
-        Matrix4x4 depthReprojInv = depthReprojMatrices[0].inverse;
+        // Get depth reprojection matrix (world -> depth camera clip space) and inverse Depth from the EnvironmentDepth API
+        // Index 0 = left eye, matching depth texture array slice 0
+        Matrix4x4[] depthReprojMatrices = Shader.GetGlobalMatrixArray(DepthReprojGlobalID);
+        Matrix4x4 depthReproj    = depthReprojMatrices[0];
+        Matrix4x4 depthReprojInv = depthReproj.inverse;
 
         // BIND EVERYTHING
         m_computeShader.SetInt("_OutWidth",  m_width);
@@ -372,8 +413,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         m_computeShader.SetVector(MapCenterID, _mapCenter);
         m_computeShader.SetVector(CamPosID, pose.position);
+        m_computeShader.SetMatrix(DepthReprojID, depthReproj);
         m_computeShader.SetMatrix(DepthReprojInvID, depthReprojInv);
-        m_computeShader.SetVector("_CamForward", pose.rotation * Vector3.forward);
 
         // depth params from Meta Global
         m_computeShader.SetVector(ZBufferParamsID, Shader.GetGlobalVector(ZBufferParamsID));
@@ -420,6 +461,19 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         }
         
 
+        // Measure the depth range of the updated panorama so the preview can normalise by it
+        if (_depthVizMat != null)
+        {
+            _depthRange.SetData(DepthRangeReset);
+            m_computeShader.SetTexture(_kernelRange, DepthEquirectID, _depthRT);
+            m_computeShader.SetBuffer(_kernelRange, DepthRangeID, _depthRange);
+            m_computeShader.Dispatch(_kernelRange, groupsX, groupsY, 1);
+
+            CollectDepthRange();
+            if (!_depthRangeRequest.HasValue)
+                _depthRangeRequest = AsyncGPUReadback.Request(_depthRange);
+        }
+
         // Refresh the color preview from the updated panorama (unseen -> magenta)
         if (_colorDisplayRT != null && _colorVizMat != null)
             Graphics.Blit(_colorRT, _colorDisplayRT, _colorVizMat);
@@ -427,9 +481,22 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         // Refresh the greyscale depth preview from the updated metric depth map
         if (_depthDisplayRT != null && _depthVizMat != null)
         {
-            _depthVizMat.SetFloat(MaxDepthID, m_depthPreviewMaxMeters);
+            _depthVizMat.SetFloat(MaxDepthID, _measuredMaxDepth > 0f ? _measuredMaxDepth : m_depthPreviewMaxMeters);
             Graphics.Blit(_depthRT, _depthDisplayRT, _depthVizMat);
         }
+    }
+
+    // Pick up a finished range readback, if there is one -> max == 0 means no valid texel was found
+    private void CollectDepthRange()
+    {
+        if (!_depthRangeRequest.HasValue || !_depthRangeRequest.Value.done) return;
+
+        if (!_depthRangeRequest.Value.hasError)
+        {
+            float measuredMax = _depthRangeRequest.Value.GetData<float>()[1];
+            if (measuredMax > 0f) _measuredMaxDepth = measuredMax;
+        }
+        _depthRangeRequest = null;
     }
 
     /// <summary>Reset both panoramas to empty.</summary>
@@ -445,6 +512,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         _state = State.Idle;
         IsReady = false;
+        _dispatchPending = false;   // drop any dispatch Update() queued for the maps we just cleared
+        _measuredMaxDepth = 0f;     // the range we measured belongs to the scan we just threw away
     }
 
     private void OnDestroy()
@@ -456,5 +525,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         if (_colorVizMat != null) Destroy(_colorVizMat);
         if (_depthVizMat != null) Destroy(_depthVizMat);
         if (_depthAccum != null) { _depthAccum.Release(); _depthAccum = null; }
+
+        if (_depthRangeRequest.HasValue) { _depthRangeRequest.Value.WaitForCompletion(); _depthRangeRequest = null; }
+        if (_depthRange != null) { _depthRange.Release(); _depthRange = null; }
     }
 }
