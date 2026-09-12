@@ -13,14 +13,16 @@
 #pragma kernel ClearDepthAccumulation
 #pragma kernel ObtainDepth
 #pragma kernel ResolveDepthAndColor
+#pragma kernel ReduceDepthRange
 
 #define PI 3.14159265f
-#define SENTINEL 0xFFFFFFFFu  // sentinel value for uninitialized texels in the depth accumulation buffer 
+#define SENTINEL 0xFFFFFFFFu  // for uninitialized texels in the depth accumulation buffer
 
 // OUTPUTS (persistent equirect panoramas, never cleared per-frame)
 RWTexture2D<float4> _ColorEquirect;           // rgb = linear color, a = 1 where filled
 RWTexture2D<float>  _DepthEquirect;           // linear metric depth in meters, 0 = unknown
 RWStructuredBuffer<uint> _DepthAccumulation;  // per-texel accumulation of depth samples (uint bits = float bits, sentinel = uninitialized)
+RWStructuredBuffer<uint> _DepthRange;         // [0] = min depth, [1] = max depth over the whole panorama (uint bits = float bits)
 
 int _OutWidth;
 int _OutHeight;
@@ -33,18 +35,17 @@ float4   _ColorCropRegion;          // (x, y, width, height) sensor crop, in sen
 
 float3   _MapCenter;                // world-space camera position at scan time -> maps anchored here (color camera position)
 float3   _CameraPos;                // current world-space camera position (from the pose of the passthrough camera)
-float3   _CamForward;               // camera forward vector
 
 Texture2D<float4> _ColorTex;
 SamplerState      sampler_ColorTex;
 
 // DEPTH (Meta EnvironmentDepthManager globals)
-Texture2DArray<float> _EnvironmentDepthTexture;                   // RFloat, linear metric depth in meters
-SamplerState          sampler_EnvironmentDepthTexture;            // sampler for the depth texture array
-float4x4              _EnvironmentDepthReprojectionMatrices[2];   // world -> depth camera clip-space reprojection matrices (slice 0 = left eye)
-float4                _EnvironmentDepthZBufferParams;             // (x = near plane, y = far plane, z = 1/(far-near), w = far/(far-near))
-float4x4              _DepthReprojInverse;                        // inverse of [0]
+float4x4              _DepthReproj;                      // world -> depth camera clip space (left eye = _EnvironmentDepthReprojectionMatrices[0])
+float4x4              _DepthReprojInverse;               // inverse of _DepthReproj: depth camera clip space -> world
+float4                _EnvironmentDepthZBufferParams;    // (x = -2fn/(f-n), y = -(f+n)/(f-n), z = 0, w = 0) 
 
+Texture2DArray<float> _EnvironmentDepthTexture;          // NON-linear depth in [0,1]; SampleDepthWorld() unprojects it to world space
+SamplerState          sampler_EnvironmentDepthTexture;   // sampler for the depth texture array
 
 static const float DEPTH_MARGIN = 0.03f;   // ignore the noisy border of the depth frame
 
@@ -108,11 +109,11 @@ bool SampleDepthWorld(float4 ndcPos, out float3 worldPoint)
 float LinearDepthMeters(float rawDepth)
 {
     float ndcDepth = rawDepth * 2.0f - 1.0f;                                                // convert to NDC [-1,1] = 2 * depth - 1
-    float denominator = ndcDepth + _EnvironmentDepthZBufferParams.y;                        // denominator = ndc + far
+    float denominator = ndcDepth + _EnvironmentDepthZBufferParams.y;                        // denominator = ndc - (f+n)/(f-n)
 
     if (abs(denominator) > 1e-6f)
     {
-        float depth_in_meters = (1.0f / denominator) * _EnvironmentDepthZBufferParams.x;    // linear depth in meters = near / (ndc + far)
+        float depth_in_meters = (1.0f / denominator) * _EnvironmentDepthZBufferParams.x;    // meters = -2fn/(f-n) / denominator
         return depth_in_meters;
     }
     return -1.0f;
@@ -147,7 +148,7 @@ void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
 
     // 3. DEPTH: project direction into the depth camera space
     // Slice 0 = left eye, matching the left color camera and reproj matrix [0].
-    float4 ndcDepthCoord = mul(_EnvironmentDepthReprojectionMatrices[0], float4(D, 0.0f));
+    float4 ndcDepthCoord = mul(_DepthReproj, float4(D, 0.0f));
 
     // check it's in front of the camera -> only half the sphere is visible
     if (ndcDepthCoord.w > 1e-5f)
@@ -186,8 +187,8 @@ void ObtainDepth(uint3 id : SV_DispatchThreadID)
     float depthScan = _DepthEquirect[id.xy];
 
     float4 ndcDepthCoord = (depthScan > 0.0f)                                                      // Check that d > 0
-        ? mul(_EnvironmentDepthReprojectionMatrices[0], float4(_MapCenter + depthScan * D, 1.0f))
-        : mul(_EnvironmentDepthReprojectionMatrices[0], float4(D, 0.0f));                          // fallback: project the direction itself if no depth is available
+        ? mul(_DepthReproj, float4(_MapCenter + depthScan * D, 1.0f))
+        : mul(_DepthReproj, float4(D, 0.0f));                                                      // fallback: project the direction itself if no depth is available
     if (ndcDepthCoord.w <= 1e-5f) return;                                                          // points behind the camera
 
     // 3. Get point X' = unprojected(X, depth) in world space. 
@@ -235,4 +236,37 @@ void ResolveDepthAndColor(uint3 id : SV_DispatchThreadID)
     // Get the color
     float3 color = _ColorTex.SampleLevel(sampler_ColorTex, sensor_coord, 0).rgb;
     _ColorEquirect[id.xy] = float4(color, 1.0f);  
+}
+
+
+groupshared uint gsMin[64];
+groupshared uint gsMax[64];
+
+[numthreads(8, 8, 1)]
+void ReduceDepthRange(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    float d = ((int)id.x < _OutWidth && (int)id.y < _OutHeight) ? _DepthEquirect[id.xy] : 0.0f;
+    bool valid = (d > 0.0f && d < 9999.0f);   // 0 = unseen
+
+    gsMin[gi] = valid ? asuint(d) : SENTINEL;
+    gsMax[gi] = valid ? asuint(d) : 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = 32u; s > 0u; s >>= 1)
+    {
+        if (gi < s)
+        {
+            gsMin[gi] = min(gsMin[gi], gsMin[gi + s]);
+            gsMax[gi] = max(gsMax[gi], gsMax[gi + s]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // gsMax[0] == 0 means this group saw no valid texel at all
+    if (gi == 0u && gsMax[0] != 0u)
+    {
+        InterlockedMin(_DepthRange[0], gsMin[0]);
+        InterlockedMax(_DepthRange[1], gsMax[0]);
+    }
 }
