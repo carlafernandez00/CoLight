@@ -509,8 +509,9 @@ MonoBehaviour:
   mipLevel: 0
   method: 1
   importanceFunction: 2
-  numSamples: 2048
-  debugDiffuseMap: 0
+  numSamples: 512
+  perProbeDistribution: 
+  debugDiffuseMap: 1
   debugProbeIndex: 4
   debugImportanceSampling: 0
   dumpOnce: 1
