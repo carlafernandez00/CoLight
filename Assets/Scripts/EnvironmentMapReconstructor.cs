@@ -17,9 +17,6 @@ using UnityEngine.UI;
 ///     projection (they differ by a few cm of lens offset).
 ///   - Not available in the Unity Editor (needs passthrough + depth on device).
 /// </summary>
-
-// Depth data instead of previous frame -> sync immediately before the camera renders the frame
-[BeforeRenderOrder(100)]
 public class EnvironmentMapReconstructor : MonoBehaviour
 {
     [Header("References")]
@@ -88,7 +85,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
     private int _kernelScan, _kernelClear, _kernelScatter, _kernelResolve, _kernelRange;
     private int _frameCounter;
-    private bool _dispatchPending;   // Update() decides, OnBeforeRender() dispatches (see [BeforeRenderOrder])
+    private bool _dispatchPending;   // Update() decides, OnBeforeRenderDispatch() dispatches
 
     // Debug logging state — one-shot flags so we log transitions, not every frame.
     private bool _loggedWaiting, _loggedPlaying, _loggedFirstFrame, _loggedFirstDispatch, _loggedNullTex;
@@ -344,8 +341,10 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     #endif
     }
 
-    // Runs in the same frame phase as EnvironmentDepthManager.OnBeforeRender but at a later
-    // order, so Shader.GetGlobalMatrixArray and the global depth texture are current-frame.
+
+    // EnvironmentDepthManager publishes from Application.onBeforeRender at the default order (0),
+    // so a later order here means the globals we read are current-frame
+    [BeforeRenderOrder(100)]     // Depth data instead of previous frame -> sync immediately before the camera renders the frame.
     private void OnBeforeRenderDispatch()
     {
         if (!_dispatchPending) return;
