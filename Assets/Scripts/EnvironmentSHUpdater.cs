@@ -59,6 +59,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
     public int numSamples = 2048;
 
+    [Range(1, 24), Tooltip("Candidates resampled per output sample, weighted by the probe's")]
+    public int numCandidates = 8;
+
     [Header("Debug diffuse map")]
     [Tooltip("Save one probe's reconstructed SH to a PNG in Assets/Debug/SHProbe (sized to the env map). Works for both methods.")]
     public bool debugDiffuseMap = true;
@@ -146,7 +149,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
                 _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
         #endif
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
-        File.WriteAllText(_profileLogPath, "frame,method,importance,probeCount,samples,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
+        File.WriteAllText(_profileLogPath, "frame,method,importance,probeCount,samples,candidates,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
 
         // Create a detached LightProbes clone and make it the active probe set.
@@ -327,6 +330,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetFloat ("_EnvSphereRadius", envSphereRadius);
         computeShader.SetInt   ("_MipLevel",        mipLevel);
         computeShader.SetInt   ("_NumSamples",      numSamples);
+        computeShader.SetInt   ("_NumCandidates",   numCandidates);
         computeShader.SetInt   ("_ImportanceFunction", (int)importanceFunction);
         computeShader.SetInt   ("_DebugProbeIndex", (debugDiffuseMap || saveSampleDump) ? debugProbeIndex : -1);
 
@@ -423,6 +427,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         double readbackS = _swReadback.Elapsed.TotalSeconds;
         double totalS    = _swTotal.Elapsed.TotalSeconds;
         int    samples   = (method == ProjectionMethod.ImportanceSampling) ? numSamples : 0;
+        int candidates   = (method == ProjectionMethod.ImportanceSampling) ? numCandidates : 0;
         string impFunc   = (method == ProjectionMethod.ImportanceSampling) ? importanceFunction.ToString() : "N/A";
 
         Debug.Log($"[EnvironmentSHUpdater] SH updated ({method}/{impFunc}) — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
@@ -431,8 +436,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // InvariantCulture forces '.' as the decimal separator; on Quest the device
         // locale may default to ',', which would corrupt the CSV columns.
         File.AppendAllText(_profileLogPath, string.Format(System.Globalization.CultureInfo.InvariantCulture,
-            "{0},{1},{2},{3},{4},{5},{6:F6},{7:F6},{8:F6},{9:F6}\n",
-            Time.frameCount, method, impFunc, bakedCount + 1, samples, mipLevel, buildS, dispatchS, readbackS, totalS));
+            "{0},{1},{2},{3},{4},{5},{6},{7:F6},{8:F6},{9:F6},{10:F6}\n",
+            Time.frameCount, method, impFunc, bakedCount + 1, samples, candidates, mipLevel, buildS, dispatchS, readbackS, totalS));
 
         // 8. Dump the debug map to disk
         if (debugDiffuseMap)
@@ -493,7 +498,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Vector3 p = _debugProbePos;
         string posStr = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
         // Sample count only applies to importance sampling; omit it for FullScan.
-        string samplesStr = (method == ProjectionMethod.ImportanceSampling) ? $"_N={numSamples}" : "";
+        string samplesStr = (method == ProjectionMethod.ImportanceSampling) ? $"_N={numSamples}_M={numCandidates}" : "";
         // string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.png";
         string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.exr";
 
@@ -534,7 +539,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Directory.CreateDirectory(dir);
  
         var    ic  = CultureInfo.InvariantCulture;
-        string tag = $"{importanceFunction}_N{numSamples}_mip{mipLevel}_{W}x{H}";
+        string tag = $"P{debugProbeIndex}_{importanceFunction}_N{numSamples}_M{numCandidates}_mip{mipLevel}_{W}x{H}";
  
         // 1. sampled texels: position, hit count, importance value
         string samplesFile = $"Samples_{tag}.csv";
@@ -571,12 +576,13 @@ public class EnvironmentSHUpdater : MonoBehaviour
         File.WriteAllBytes(Path.Combine(dir, impFile), impBytes);
  
         // 3. metadata 
-        string metaFile = $"Dump_{importanceFunction}_N{numSamples}_mip{mipLevel}.json";
+        string metaFile = $"Dump_{tag}.json";
         var    meta     = new StringBuilder();
         meta.Append("{\n");
         meta.AppendFormat(ic, "  \"importanceFunction\": \"{0}\",\n", importanceFunction);
         meta.AppendFormat(ic, "  \"importanceMode\": {0},\n",         (int)importanceFunction);
         meta.AppendFormat(ic, "  \"numSamples\": {0},\n",             numSamples);
+        meta.AppendFormat(ic, "  \"numCandidates\": {0},\n",          numCandidates);
         meta.AppendFormat(ic, "  \"mipLevel\": {0},\n",               mipLevel);
         meta.AppendFormat(ic, "  \"width\": {0},\n",                  W);
         meta.AppendFormat(ic, "  \"height\": {0},\n",                 H);
