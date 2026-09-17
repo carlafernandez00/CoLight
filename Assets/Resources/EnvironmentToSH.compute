@@ -22,6 +22,7 @@ float               _EnvSphereRadius;       // Radius of the virtual environment
 int                 _ProbeIndex;            // Probe slot: coefficients written at [_ProbeIndex*9 + i]
 int                 _NumSamples;            // (Importance sampling only) number of Monte Carlo samples per probe
 int                 _ImportanceFunction;    // (Importance sampling only) 0 = luminance, 1 = color aware, 2 = uniform (weight 1)  
+int                 _NumCandidates;         // (Importance sampling only) M candidates resampled per output sample
 
 // OUTPUT
 // 9 SH coefficients per probe, one float3 (RGB) per coefficient -> buffer must have (_ProbeIndex + 1) * 9 elements
@@ -76,6 +77,9 @@ float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }        
 #define IMPORTANCE_COLOR     1
 #define IMPORTANCE_UNIFORM   2
 
+// Importance sampling max candidates
+#define MAX_CANDIDATES 24
+groupshared float gCandidatesGeom[MAX_CANDIDATES][NUM_THREADS];
 
 // Lambertian Convolution - radiance SH -> diffuse response 
 // Ramamoorthi & Hanrahan 2001 zonal factors divided through by A0
@@ -106,6 +110,22 @@ float3 DirFromUV(float u, float v)
     return float3(sinTheta * sin(phi), cos(theta), sinTheta * cos(phi));
 }
 
+// ---------------------------------------------------------------------------
+// Parallax / probe-offset geometric factor.
+//    geom = dΩ_probe / dΩ_env = R² · cos∠(dir, dirProbe) / ‖R·dir − P‖²
+// ---------------------------------------------------------------------------
+float ProbeGeom(float3 dir, float3 probePosition, float R, out float3 dirProbe)
+{
+    float3 Q        = R * dir;                        // point on the virtual sphere
+    float3 V        = Q - probePosition;              // direction probe → Q
+    float  distSq   = max(dot(V, V), 1e-6f * R * R);  
+    float  dist     = sqrt(distSq);
+    dirProbe = V /dist;                        // normalize(Q - P)
+    float  cosAngle = dot(dir, dirProbe);
+    
+    float geom = max(cosAngle, 0.0f) * R * R / distSq; // dΩ_probe / dΩ
+    return geom;
+}
 
 // ---------------------------------------------------------------------------
 // Groupshared memory: each thread accumulates into its own slot (no atomics).
@@ -365,6 +385,87 @@ float2 Random2(uint i, uint seed)
                   h2 * 2.3283064365386963e-10f);
 }
 
+// Sample Candidate sturct
+struct Candidate
+{
+    float2 uv;          // texel-centre UV
+    int2   texel;       // (x, y) in mip-level coordinates
+    float3 dirProbe;    // direction probe
+    float  pOmega;      // sampling density in solid-angle (env-sphere) measure
+    float  geom;        // dΩ_probe / dΩ_env  — the resampling weight
+};
+
+// Find sample candidate by considering the probe position weight
+Candidate DrawCandidate(uint sampleIndex, uint TOTAL, int W, int H)
+{
+    Candidate candidate = (Candidate)0;
+
+    // 1: Hammersley: gives well-spread 2D points xi. Deterministic -> no flicker across frames
+    float2 xi = Hammersley(sampleIndex, TOTAL);
+
+    // 2: Inverse-CDF sampling of the 2D luminance distribution: PBRT Distribution2D sampling algorithm
+    // Pick a row v from the marginal CDF (binary search) 
+    int lo = 0, hi = H;
+    [loop] while (lo + 1 < hi) { 
+        int mid = (lo + hi) >> 1;           // midpoint of the current search window
+        if (_MarginalCdf[mid] <= xi.x)      
+            lo = mid;                       // if lower or eq than xi.x, look into higher rows
+        else                       
+            hi = mid;                       // look into lower rows 
+    }
+    int   y      = lo;
+    float m0     = _MarginalCdf[y];
+    float m1     = _MarginalCdf[y + 1];
+    float mSlope = m1 - m0;                 // width of the boundaries = row "y" probability
+    float pdfV   = (float)H * mSlope;       // marginal density (over [0,1])
+
+    // Pick a column u from that row's conditional CDF 
+    int cbase = y * (W + 1);
+    int lo2 = 0, hi2 = W;
+    [loop] while (lo2 + 1 < hi2) 
+    { 
+        int mid2 = (lo2 + hi2) >> 1; 
+        if (_CondCdf[cbase + mid2] <= xi.y) lo2 = mid2; 
+        else hi2 = mid2; 
+    }
+    int   x      = lo2;
+    float c0     = _CondCdf[cbase + x];
+    float c1     = _CondCdf[cbase + x + 1];
+    float cSlope = c1 - c0;
+    float pdfU   = (float)W * cSlope;                    // conditional density (over [0,1])
+
+
+    // 3: UV → spherical angles  with Y-up 
+    float v      = (y + 0.5) / (float)H;
+    float u      = (x + 0.5) / (float)W;
+
+    float phi      = (u - 0.5f) * 2.0f * PI;
+    float theta    = (1.0f - v) * PI;
+    float sinTheta = sin(theta);
+    float3 dir = float3(
+        sinTheta * sin(phi),    // x 
+        cos(theta),             // y (up) (Unity convention)
+        sinTheta * cos(phi)     // z
+    );
+    
+    // 4: UV density → solid-angle density: dΩ = 2π²·sinθ · du·dv
+    float pdfUV  = pdfU * pdfV;                          // density over the unit uv square
+    float pOmega = pdfUV / (2.0f * PI * PI * max(sinTheta, 1e-4f));
+
+    // 5: parallax correction for probe position
+    float3 dirProbe;
+    float  geom = ProbeGeom(dir, _ProbePosition, _EnvSphereRadius, dirProbe);      // dΩ_probe / dΩ
+    
+    // define candidate
+    candidate.uv       = float2(u, v);
+    candidate.texel    = int2(x, y);
+    candidate.dirProbe = dirProbe;
+    candidate.pOmega   = pOmega;
+    candidate.geom     = (pOmega > 1e-12f) ? geom : 0.0f;
+    return candidate;
+
+}
+
 // ===========================================================================
 // Importance-sampling projection kernel
 // One thread group per probe (dispatch (1,1,1) per probe, like the full scan).
@@ -379,95 +480,68 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     gWeight[threadIndex] = 0.0f;
 
     // Mip-level dims and number of samples (importance sampling)
-    float R = _EnvSphereRadius;
     int   W = max(1, _TexWidth  >> _MipLevel);
     int   H = max(1, _TexHeight >> _MipLevel);
     uint  N = (uint)max(1, _NumSamples);
+    uint  M = min((uint)max(1, _NumCandidates), (uint)MAX_CANDIDATES);
+    uint TOTAL = N * M;
 
     // Monte Carlo loop: each thread draws a strided subset of the N Hammersley samples
     for (uint s = threadIndex; s < N; s += NUM_THREADS)
     {
-        // 1: Hammersley: gives well-spread 2D points xi. Deterministic -> no flicker across frames
-        float2 xi = Hammersley(s, N);
-        // float2 xi = Random2(s, 0u); 
-
-        // 2: Inverse-CDF sampling of the 2D luminance distribution: PBRT Distribution2D sampling algorithm
-        // Pick a row v from the marginal CDF (binary search) 
-        // TODO: create function
-        int lo = 0, hi = H;
-        [loop] while (lo + 1 < hi) { 
-            int mid = (lo + hi) >> 1;           // midpoint of the current search window
-            if (_MarginalCdf[mid] <= xi.x)      
-                lo = mid;                       // if lower or eq than xi.x, look into higher rows
-            else                       
-                hi = mid;                       // look into lower rows 
+        // 1: Generate M candidates and choose by geometrical weight the winning candidate
+        float geomSum = 0.0f;
+        [loop] for (uint m = 0; m < M; m++)
+        {
+            Candidate candidate = DrawCandidate(s+m*N, TOTAL, W, H);
+            gCandidatesGeom[m][threadIndex] = candidate.geom;
+            geomSum += candidate.geom;
         }
-        int   y      = lo;
-        float m0     = _MarginalCdf[y];
-        float m1     = _MarginalCdf[y + 1];
-        float mSlope = m1 - m0;                 // width of the boundaries = row "y" probability
-        float pdfV   = (float)H * mSlope;       // marginal density (over [0,1])
+        if (geomSum <= 0.0f) continue;
 
-        // Pick a column u from that row's conditional CDF 
-        int cbase = y * (W + 1);
-        int lo2 = 0, hi2 = W;
-        [loop] while (lo2 + 1 < hi2) { int mid2 = (lo2 + hi2) >> 1; if (_CondCdf[cbase + mid2] <= xi.y) lo2 = mid2; else hi2 = mid2; }
-        int   x      = lo2;
-        float c0     = _CondCdf[cbase + x];
-        float c1     = _CondCdf[cbase + x + 1];
-        float cSlope = c1 - c0;
-        float pdfU   = (float)W * cSlope;                    // conditional density (over [0,1])
-    
-        float pdfUV  = pdfU * pdfV;                          // density over the unit uv square
-        float v      = (y + 0.5) / (float)H;
-        float u      = (x + 0.5) / (float)W;
+
+        // Generate random value (0, 1) by the total sum of weight
+        float rand = Random2(s, (uint)_ProbeIndex).x * geomSum;
+
+        // Choose sample
+        uint mWin = M - 1;
+        float acc     = 0.0f;
+        [loop] for (uint m2 = 0; m2 < M; m2++)
+        {
+            acc += gCandidatesGeom[m2][threadIndex];
+            if (acc > rand)
+            {
+                mWin = m2;
+                break;
+            }
+        }
+
+        // Regenerate the winning sample
+        Candidate win = DrawCandidate(s + mWin * N, TOTAL, W, H);
 
         #ifdef DEBUG_IMPORTANCE_SAMPLING
             if (_ProbeIndex == _DebugProbeIndex)
-                InterlockedAdd(_SampleCount[y * W + x], 1u);     // count how many times this texel was picked
+                InterlockedAdd(_SampleCount[win.texel.y * W + win.texel.x], 1u);     // count how many times this texel was picked
         #endif
 
-        // 3: UV → spherical angles  with Y-up 
-        float phi      = (u - 0.5f) * 2.0f * PI;
-        float theta    = (1.0f - v) * PI;
-        float sinTheta = sin(theta);
-        float3 dir = float3(
-            sinTheta * sin(phi),    // x 
-            cos(theta),             // y (up) (Unity convention)
-            sinTheta * cos(phi)     // z
-        );
+        
+        // 2: accumulate the estimator  f(ω)/p(ω)
+        float  w        = geomSum / (win.pOmega * (float)M);               // sample weight                                                   
+        float3 color    = _EquirectMap.SampleLevel(sampler_EquirectMap, win.uv, _MipLevel).rgb;  // environment color at this direction
 
-        // 4: UV density → solid-angle density: dΩ = 2π²·sinθ · du·dv
-        float pOmega = pdfUV / (2.0f * PI * PI * max(sinTheta, 1e-4f));
-        if (pOmega <= 1e-12f) continue;
-
-        // 5: parallax correction for probe position
-        float3 Q        = R * dir;                        // point on the virtual sphere
-        float3 V        = Q - _ProbePosition;             // direction probe → Q
-        float  distSq   = max(dot(V, V), 1e-6f * R * R);  
-        float  dist     = sqrt(distSq);
-        float3 dirProbe = V /dist;                        // normalize(Q - P)
-        float  cosAngle = dot(dir, dirProbe);
-        float  geom     = R * R * cosAngle / distSq;      // dΩ_probe / dΩ
-
-        // 6: accumulate the estimator  f(ω)/p(ω)
-        float inv_pOmega = 1.0f / pOmega;                 // Monte Carlo weight = 1 / pdf
-        float  w        = geom * inv_pOmega;              // sample weight                                                           // distribution weight (dOmegaProbe/pdf)
-        float3 color    = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;  // environment color at this direction
-
-        gSH[threadIndex][0] += color * SH_Y00()          * w;
-        gSH[threadIndex][1] += color * SH_Y1n1(dirProbe) * w;
-        gSH[threadIndex][2] += color * SH_Y10 (dirProbe) * w;
-        gSH[threadIndex][3] += color * SH_Y1p1(dirProbe) * w;
-        gSH[threadIndex][4] += color * SH_Y2n2(dirProbe) * w;
-        gSH[threadIndex][5] += color * SH_Y2n1(dirProbe) * w;
-        gSH[threadIndex][6] += color * SH_Y20 (dirProbe) * w;
-        gSH[threadIndex][7] += color * SH_Y2p1(dirProbe) * w;
-        gSH[threadIndex][8] += color * SH_Y2p2(dirProbe) * w;
+        gSH[threadIndex][0] += color * SH_Y00()              * w;
+        gSH[threadIndex][1] += color * SH_Y1n1(win.dirProbe) * w;
+        gSH[threadIndex][2] += color * SH_Y10 (win.dirProbe) * w;
+        gSH[threadIndex][3] += color * SH_Y1p1(win.dirProbe) * w;
+        gSH[threadIndex][4] += color * SH_Y2n2(win.dirProbe) * w;
+        gSH[threadIndex][5] += color * SH_Y2n1(win.dirProbe) * w;
+        gSH[threadIndex][6] += color * SH_Y20 (win.dirProbe) * w;
+        gSH[threadIndex][7] += color * SH_Y2p1(win.dirProbe) * w;
+        gSH[threadIndex][8] += color * SH_Y2p2(win.dirProbe) * w;
         gWeight[threadIndex] += w;
     }
 
-    // 7: Halving reduction: 64 accumulators → slot [0]                                                                      
+    // 3: Halving reduction: 64 accumulators → slot [0]                                                                      
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint stride = NUM_THREADS / 2; stride > 0; stride >>= 1)
     {
@@ -479,11 +553,11 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // 8: normalization and write-out (thread 0 only)  
+    // 4: normalization and write-out (thread 0 only)  
     if (threadIndex == 0)
     {
-        // float normFactor = (4.0f * PI) / gWeight[0];  // ratio (self-normalized) estimator
-        float normFactor = 1.0f / (float)max(1, _NumSamples);
+        float normFactor = (4.0f * PI) / gWeight[0];  // ratio (self-normalized) estimator
+        // float normFactor = 1.0f / (float)max(1, _NumSamples);
         [unroll] for (int j = 0; j < 9; j++) gSH[0][j] *= normFactor;
 
         int outBase = _ProbeIndex * 9;
