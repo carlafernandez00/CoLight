@@ -516,12 +516,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
     }
 
     // Saves the importance sampling data to disk for visualization/debugging. Writes the following files:
-    //   Samples_<imp>_N<n>_mip<m>_<W>x<H>.csv    x,y,u,v,count,importance   (only texels with count > 0)
-    //   Importance_<imp>_mip<m>_<W>x<H>.f32      W*H float32,               (greyscale importance map)
-    //   Dump_<imp>_N<n>_mip<m>.json              metadata + the file names above
-    //
+    //   Samples_<imp>_N<n>_mip<m>_<W>x<H>.csv    x,y,count                  (only texels with count > 0)
+    //   Importance_<imp>_mip<m>_<W>x<H>.f32      W*H float32,               (greyscale importance map)    //
     // Row order matches Unity UV space: index = y*W + x with u = (x+0.5)/W, v = (y+0.5)/H,
-    // and v = 0 is the SOUTH pole -> row 0 is the BOTTOM image row (matplotlib: origin='lower').
     private void SaveSampleDumpToDisk()
     {
         if (_sampleCountBuffer == null || _dumpW <= 0 || _dumpH <= 0) return;
@@ -544,11 +541,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // 1. sampled texels: position, hit count, importance value
         string samplesFile = $"Samples_{tag}.csv";
         var    sb          = new StringBuilder(1 << 16);
-        sb.Append("x,y,u,v,count,importance\n");
+        sb.Append("x,y,count\n");
  
-        long totalHits    = 0;
-        int  uniqueTexels = 0;
-        uint maxCount     = 0;
         for (int y = 0; y < H; y++)
         {
             int row = y * W;
@@ -556,15 +550,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
             {
                 uint cnt = _sampleCountRaw[row + x];
                 if (cnt == 0) continue;
- 
-                uniqueTexels++;
-                totalHits += cnt;
-                if (cnt > maxCount) maxCount = cnt;
- 
-                float u = (x + 0.5f) / W;
-                float v = (y + 0.5f) / H;
-                sb.AppendFormat(ic, "{0},{1},{2:F6},{3:F6},{4},{5:G9}\n",
-                                x, y, u, v, cnt, _importanceRaw[row + x]);
+                sb.AppendFormat(ic, "{0},{1},{2}\n", x, y, cnt);
             }
         }
         File.WriteAllText(Path.Combine(dir, samplesFile), sb.ToString());
@@ -574,31 +560,6 @@ public class EnvironmentSHUpdater : MonoBehaviour
         var    impBytes  = new byte[W * H * sizeof(float)];
         Buffer.BlockCopy(_importanceRaw, 0, impBytes, 0, impBytes.Length);
         File.WriteAllBytes(Path.Combine(dir, impFile), impBytes);
- 
-        // 3. metadata 
-        string metaFile = $"Dump_{tag}.json";
-        var    meta     = new StringBuilder();
-        meta.Append("{\n");
-        meta.AppendFormat(ic, "  \"importanceFunction\": \"{0}\",\n", importanceFunction);
-        meta.AppendFormat(ic, "  \"importanceMode\": {0},\n",         (int)importanceFunction);
-        meta.AppendFormat(ic, "  \"numSamples\": {0},\n",             numSamples);
-        meta.AppendFormat(ic, "  \"numCandidates\": {0},\n",          numCandidates);
-        meta.AppendFormat(ic, "  \"mipLevel\": {0},\n",               mipLevel);
-        meta.AppendFormat(ic, "  \"width\": {0},\n",                  W);
-        meta.AppendFormat(ic, "  \"height\": {0},\n",                 H);
-        meta.AppendFormat(ic, "  \"texWidth\": {0},\n",               _currentEnvTex.width);
-        meta.AppendFormat(ic, "  \"texHeight\": {0},\n",              _currentEnvTex.height);
-        meta.AppendFormat(ic, "  \"probeIndex\": {0},\n",             debugProbeIndex);
-        meta.AppendFormat(ic, "  \"envSphereRadius\": {0:G9},\n",     envSphereRadius);
-        meta.AppendFormat(ic, "  \"uniqueTexels\": {0},\n",           uniqueTexels);
-        meta.AppendFormat(ic, "  \"totalHits\": {0},\n",              totalHits);
-        meta.AppendFormat(ic, "  \"maxCount\": {0},\n",               maxCount);
-        meta.Append       (    "  \"rowMajor\": true,\n");
-        meta.Append       (    "  \"uvConvention\": \"u=(x+0.5)/W, v=(y+0.5)/H, v=0 is the south pole (bottom row)\",\n");
-        meta.AppendFormat(ic, "  \"samplesFile\": \"{0}\",\n",        samplesFile);
-        meta.AppendFormat(ic, "  \"importanceFile\": \"{0}\"\n",      impFile);
-        meta.Append("}\n");
-        File.WriteAllText(Path.Combine(dir, metaFile), meta.ToString());
     }
  
     // Sizes the sample-dump buffers to the mip dimensions and only rebuilds when they change.
