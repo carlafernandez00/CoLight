@@ -13,7 +13,6 @@
 #pragma kernel ClearDepthAccumulation
 #pragma kernel ObtainDepth
 #pragma kernel ResolveDepthAndColor
-#pragma kernel ReduceDepthRange
 
 #define PI 3.14159265f
 #define SENTINEL 0xFFFFFFFFu  // for uninitialized texels in the depth accumulation buffer
@@ -22,7 +21,6 @@
 RWTexture2D<float4> _ColorEquirect;           // rgb = linear color, a = 1 where filled
 RWTexture2D<float>  _DepthEquirect;           // linear metric depth in meters, 0 = unknown
 RWStructuredBuffer<uint> _DepthAccumulation;  // per-texel accumulation of depth samples (uint bits = float bits, sentinel = uninitialized)
-RWStructuredBuffer<uint> _DepthRange;         // [0] = min depth, [1] = max depth over the whole panorama (uint bits = float bits)
 
 int _OutWidth;
 int _OutHeight;
@@ -236,37 +234,4 @@ void ResolveDepthAndColor(uint3 id : SV_DispatchThreadID)
     // Get the color
     float3 color = _ColorTex.SampleLevel(sampler_ColorTex, sensor_coord, 0).rgb;
     _ColorEquirect[id.xy] = float4(color, 1.0f);  
-}
-
-
-groupshared uint gsMin[64];
-groupshared uint gsMax[64];
-
-[numthreads(8, 8, 1)]
-void ReduceDepthRange(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
-{
-    float d = ((int)id.x < _OutWidth && (int)id.y < _OutHeight) ? _DepthEquirect[id.xy] : 0.0f;
-    bool valid = (d > 0.0f && d < 9999.0f);   // 0 = unseen
-
-    gsMin[gi] = valid ? asuint(d) : SENTINEL;
-    gsMax[gi] = valid ? asuint(d) : 0u;
-    GroupMemoryBarrierWithGroupSync();
-
-    [unroll]
-    for (uint s = 32u; s > 0u; s >>= 1)
-    {
-        if (gi < s)
-        {
-            gsMin[gi] = min(gsMin[gi], gsMin[gi + s]);
-            gsMax[gi] = max(gsMax[gi], gsMax[gi + s]);
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    // gsMax[0] == 0 means this group saw no valid texel at all
-    if (gi == 0u && gsMax[0] != 0u)
-    {
-        InterlockedMin(_DepthRange[0], gsMin[0]);
-        InterlockedMax(_DepthRange[1], gsMax[0]);
-    }
 }
