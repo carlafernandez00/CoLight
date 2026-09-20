@@ -1,6 +1,5 @@
 using Meta.XR;
 using UnityEngine;
-using UnityEngine.Rendering;
 using UnityEngine.UI;
 
 /// <summary>
@@ -76,14 +75,9 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private Material      _colorVizMat;
     private Material      _depthVizMat;
     private ComputeBuffer _depthAccum;
-    private ComputeBuffer _depthRange;
     private Vector3       _mapCenter;
 
-    private static readonly uint[] DepthRangeReset = { 0u, 0u };   // min = sentinel, max = 0
-    private AsyncGPUReadbackRequest? _depthRangeRequest;
-    private float _measuredMaxDepth;                                // 0 = nothing measured yet, fall back to m_depthPreviewMaxMeters
-
-    private int _kernelScan, _kernelClear, _kernelScatter, _kernelResolve, _kernelRange;
+    private int _kernelScan, _kernelClear, _kernelScatter, _kernelResolve;
     private int _frameCounter;
     private bool _dispatchPending;   // Update() decides, OnBeforeRenderDispatch() dispatches
 
@@ -97,7 +91,6 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private static readonly int DepthTexGlobalName = Shader.PropertyToID("_EnvironmentDepthTexture");
     private static readonly int ZBufferParamsID    = Shader.PropertyToID("_EnvironmentDepthZBufferParams");
     private static readonly int DepthAccumID       = Shader.PropertyToID("_DepthAccumulation");
-    private static readonly int DepthRangeID       = Shader.PropertyToID("_DepthRange");
      private static readonly int MapCenterID       = Shader.PropertyToID("_MapCenter");
     private static readonly int CamPosID           = Shader.PropertyToID("_CameraPos");
     private static readonly int DepthReprojGlobalID = Shader.PropertyToID("_EnvironmentDepthReprojectionMatrices");
@@ -145,7 +138,6 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         _kernelClear = m_computeShader.FindKernel("ClearDepthAccumulation");
         _kernelScatter = m_computeShader.FindKernel("ObtainDepth");
         _kernelResolve = m_computeShader.FindKernel("ResolveDepthAndColor");
-        _kernelRange = m_computeShader.FindKernel("ReduceDepthRange");
 
         // Material used to paint unseen texels (alpha 0) magenta in the color preview.
         if (m_colorPreview != null)
@@ -193,9 +185,6 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         // Per-frame nim accumulator. Buffer rather than texture because InterlockedMin needs a uint UAV
         _depthAccum = new ComputeBuffer(m_width * m_height, sizeof(uint));
-
-        // Two uints: measured min and max depth over the panorama, for the preview's range.
-        _depthRange = new ComputeBuffer(2, sizeof(uint));
 
         // Start empty (color = transparent black, depth = 0 = "unseen").
         ClearRT(_colorRT, Color.clear);
@@ -459,20 +448,6 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         }
         
-
-        // Measure the depth range of the updated panorama so the preview can normalise by it
-        if (_depthVizMat != null)
-        {
-            _depthRange.SetData(DepthRangeReset);
-            m_computeShader.SetTexture(_kernelRange, DepthEquirectID, _depthRT);
-            m_computeShader.SetBuffer(_kernelRange, DepthRangeID, _depthRange);
-            m_computeShader.Dispatch(_kernelRange, groupsX, groupsY, 1);
-
-            CollectDepthRange();
-            if (!_depthRangeRequest.HasValue)
-                _depthRangeRequest = AsyncGPUReadback.Request(_depthRange);
-        }
-
         // Refresh the color preview from the updated panorama (unseen -> magenta)
         if (_colorDisplayRT != null && _colorVizMat != null)
             Graphics.Blit(_colorRT, _colorDisplayRT, _colorVizMat);
@@ -480,22 +455,9 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         // Refresh the greyscale depth preview from the updated metric depth map
         if (_depthDisplayRT != null && _depthVizMat != null)
         {
-            _depthVizMat.SetFloat(MaxDepthID, _measuredMaxDepth > 0f ? _measuredMaxDepth : m_depthPreviewMaxMeters);
+            _depthVizMat.SetFloat(MaxDepthID, m_depthPreviewMaxMeters);
             Graphics.Blit(_depthRT, _depthDisplayRT, _depthVizMat);
         }
-    }
-
-    // Pick up a finished range readback, if there is one -> max == 0 means no valid texel was found
-    private void CollectDepthRange()
-    {
-        if (!_depthRangeRequest.HasValue || !_depthRangeRequest.Value.done) return;
-
-        if (!_depthRangeRequest.Value.hasError)
-        {
-            float measuredMax = _depthRangeRequest.Value.GetData<float>()[1];
-            if (measuredMax > 0f) _measuredMaxDepth = measuredMax;
-        }
-        _depthRangeRequest = null;
     }
 
     /// <summary>Reset both panoramas to empty.</summary>
@@ -512,7 +474,6 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         _state = State.Idle;
         IsReady = false;
         _dispatchPending = false;   // drop any dispatch Update() queued for the maps we just cleared
-        _measuredMaxDepth = 0f;     // the range we measured belongs to the scan we just threw away
     }
 
     private void OnDestroy()
@@ -524,8 +485,5 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         if (_colorVizMat != null) Destroy(_colorVizMat);
         if (_depthVizMat != null) Destroy(_depthVizMat);
         if (_depthAccum != null) { _depthAccum.Release(); _depthAccum = null; }
-
-        if (_depthRangeRequest.HasValue) { _depthRangeRequest.Value.WaitForCompletion(); _depthRangeRequest = null; }
-        if (_depthRange != null) { _depthRange.Release(); _depthRange = null; }
     }
 }

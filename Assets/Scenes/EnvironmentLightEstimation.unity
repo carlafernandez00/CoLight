@@ -511,7 +511,7 @@ MonoBehaviour:
   importanceFunction: 1
   numSamples: 512
   numCandidates: 16
-  debugDiffuseMap: 1
+  debugDiffuseMap: 0
   debugProbeIndex: 0
   debugImportanceSampling: 0
   dumpOnce: 1
@@ -1397,7 +1397,7 @@ MonoBehaviour:
   m_statusText: {fileID: 303377060}
   m_colorPreview: {fileID: 8745435}
   m_depthPreview: {fileID: 1102845166}
-  m_depthPreviewMaxMeters: 5
+  m_depthPreviewMaxMeters: 3
 --- !u!4 &1253898668
 Transform:
   m_ObjectHideFlags: 0
