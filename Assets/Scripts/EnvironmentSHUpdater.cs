@@ -49,12 +49,22 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Uniform              // Importance = 1 (no weighting)
     }
 
+    public enum ProbeAwareSampling
+    {
+        None,                 // shared distribution
+        Resampling,           // Shared distribution + resampling
+        PerProbeDistribution  // construct one distrib per probe
+    }
+
     [Header("Projection method")]
     [Tooltip("FullScan visits every texel. ImportanceSampling draws numSamples from a luminance-weighted distribution.")]
     public ProjectionMethod method = ProjectionMethod.FullScan;
 
     [Tooltip("Importance function used to build the sampling distribution (ImportanceSampling only).")]
     public ImportanceFunction importanceFunction = ImportanceFunction.Luminance;
+
+    [Tooltip("How the probe position enters the estimate. ImportanceSampling only.")]
+    public ProbeAwareSampling probeAware = ProbeAwareSampling.None;
 
     [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
     public int numSamples = 2048;
@@ -81,7 +91,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private float[]       _shRaw;
     private int           _kernelFull;
     private int           _kernelIS;
+    private int           _kernelRIS;
     private int           _kernelBuildCond;
+    private int           _kernelBuildProbeCond; 
     private int           _kernelBuildMarg;
     private int           _activeKernel;
     private int           _frameCounter;
@@ -94,7 +106,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private ComputeBuffer _condCdfBuffer;      // mipH * (mipW + 1) floats
     private ComputeBuffer _marginalCdfBuffer;  // mipH + 1 floats
     private ComputeBuffer _marginalFuncBuffer; // mipH floats
-    private int           _distW, _distH;      // dims the distribution buffers were built for
+    private int           _distW, _distH, _distributionIndex;  // dims the distribution buffers were built for
 
     // Debug Importance Sampling
     private ComputeBuffer _sampleCountBuffer;  // mipW * mipH uints, counts how many times each texel was sampled
@@ -115,10 +127,32 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private readonly Stopwatch _swReadback = new Stopwatch();  // Time spent reading back the results
     private readonly Stopwatch _swBuild    = new Stopwatch();  // Time spent building the luminance distribution (Importance Sampling only)
     private string _profileLogPath;
-
+    private bool UsesSampling  => method == ProjectionMethod.ImportanceSampling;
+    private bool UsesResampling=> UsesSampling && probeAware == ProbeAwareSampling.Resampling;
+    private bool UsesPerProbe  => UsesSampling && probeAware == ProbeAwareSampling.PerProbeDistribution;
+    private int EffectiveCandidates => UsesResampling ? Mathf.Clamp(numCandidates, 1, 24) : 1;
+    
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
+    private int SelectKernel()
+    {
+        if (!UsesSampling)  return _kernelFull;
+        if (UsesResampling) return _kernelRIS;
+        return _kernelIS;                     // None and PerProbeDistribution share this one
+    }
+
+    private string ModeTag()
+    {
+        if (!UsesSampling) return "FullScan";
+        switch (probeAware)
+        {
+            case ProbeAwareSampling.Resampling:           return "IS-Resampling";
+            case ProbeAwareSampling.PerProbeDistribution: return "IS-PerProbe";
+            default:                                      return "IS-None";
+        }
+    }
+
 
     void Awake()
     {
@@ -132,10 +166,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
     void OnEnable()
     {
-        _kernelFull      = computeShader.FindKernel("ProjectEquirectToSH");
-        _kernelIS        = computeShader.FindKernel("ProjectEquirectToSH_IS");
-        _kernelBuildCond = computeShader.FindKernel("BuildConditionalCDF");
-        _kernelBuildMarg = computeShader.FindKernel("BuildMarginalCDF");
+        _kernelFull           = computeShader.FindKernel("ProjectEquirectToSH");
+        _kernelIS             = computeShader.FindKernel("ProjectEquirectToSH_IS");
+        _kernelRIS            = computeShader.FindKernel("ProjectEquirectToSH_RIS");
+        _kernelBuildCond      = computeShader.FindKernel("BuildConditionalCDF");
+        _kernelBuildProbeCond = computeShader.FindKernel("BuildProbeConditionalCDF");
+        _kernelBuildMarg      = computeShader.FindKernel("BuildMarginalCDF");
         EnsureBuffer(1); // at minimum one slot for the ambient probe
 
         _sampleDumpWritten = false; 
@@ -149,7 +185,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
                 _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
         #endif
         Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
-        File.WriteAllText(_profileLogPath, "frame,method,importance,probeCount,samples,candidates,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
+        File.WriteAllText(_profileLogPath,"frame,mode,importance,probeCount,samples,candidates,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
         Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
 
         // Create a detached LightProbes clone and make it the active probe set.
@@ -166,13 +202,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _shBuffer?.Release();
         _shBuffer = null;
 
-        _condCdfBuffer?.Release();      _condCdfBuffer      = null;
-        _marginalCdfBuffer?.Release();  _marginalCdfBuffer  = null;
-        _marginalFuncBuffer?.Release(); _marginalFuncBuffer = null;
-        _distW = _distH = 0;
+        ReleaseDistributionBuffers();
 
         _sampleCountBuffer?.Release();  _sampleCountBuffer  = null;
-        _importanceMapBuffer?.Release(); _importanceMapBuffer = null;
         _dumpW = _dumpH = 0;
 
         if (_diffuseRenderTexture != null) { _diffuseRenderTexture.Release(); _diffuseRenderTexture = null; }
@@ -311,10 +343,17 @@ public class EnvironmentSHUpdater : MonoBehaviour
         SphericalHarmonicsL2[] bakedProbes = _runtimeProbes.bakedProbes;
         Vector3[]              positions   = _runtimeProbes.positions;
         int bakedCount = bakedProbes != null ? bakedProbes.Length : 0;
+        int probeCount = bakedCount + 1;  // bakedCount + 1 : slot 0 reserved for ambient probe
+        
+
+        var probePos = new Vector3[probeCount];
+        probePos[0] = Vector3.zero;                   // ambient probe lives at the origin
+        for (int i = 0; i < bakedCount; i++)
+            probePos[i + 1] = (positions != null && i < positions.Length) ? positions[i] : Vector3.zero;
+
 
         // Ensure we have enough space in our buffers 
-        // bakedCount + 1 : slot 0 reserved for ambient probe
-        EnsureBuffer(bakedCount + 1);
+        EnsureBuffer(probeCount);
 
         bool saveSampleDump = debugImportanceSampling && method == ProjectionMethod.ImportanceSampling 
                                                       && !(dumpOnce && _sampleDumpWritten);
@@ -322,7 +361,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _swTotal.Restart(); // reset + start
 
         // Select the kernel for this update
-        _activeKernel = (method == ProjectionMethod.ImportanceSampling) ? _kernelIS : _kernelFull;
+        _activeKernel = SelectKernel();
 
         // 1. Global constants (SetInt/SetFloat are shared across all kernels)
         computeShader.SetInt   ("_TexWidth",        _currentEnvTex.width);
@@ -341,28 +380,28 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // 1a. Importance sampling: build the luminance distribution ONCE.
         // It depends only on the env map, so all probes reuse it.
         _swBuild.Reset();
-        if (method == ProjectionMethod.ImportanceSampling)
+        if (UsesSampling)
         {
             int mipW = Mathf.Max(1, _currentEnvTex.width  >> mipLevel);
             int mipH = Mathf.Max(1, _currentEnvTex.height >> mipLevel);
-            EnsureDistributionBuffers(mipW, mipH);
+
+            // if per-probe distrobution, one CDF slot per probe, otherwise 1
+            EnsureDistributionBuffers(mipW, mipH, UsesPerProbe ? probeCount : 1);
             
             if (saveSampleDump)
             {
                 EnsureSampleDumpBuffers(mipW, mipH);
                 _sampleCountBuffer.SetData(_sampleCountZeros);     // reset hits per texel
-
                 computeShader.SetBuffer(_activeKernel, "_SampleCount", _sampleCountBuffer);
-                computeShader.SetBuffer(_kernelBuildCond, "_ImportanceMap", _importanceMapBuffer);
             } 
 
             _swBuild.Start();
-            BuildLuminanceDistribution(mipW, mipH);
+            BuildDistributions(mipH, probePos);
             _swBuild.Stop();
 
             // Bind the distribution buffers to the sampling kernel
-            computeShader.SetBuffer(_kernelIS, "_CondCdf",     _condCdfBuffer);
-            computeShader.SetBuffer(_kernelIS, "_MarginalCdf", _marginalCdfBuffer);
+            computeShader.SetBuffer(_activeKernel, "_CondCdf",     _condCdfBuffer);
+            computeShader.SetBuffer(_activeKernel, "_MarginalCdf", _marginalCdfBuffer);
         }
 
         // 1b. Bind common resources to the active kernel
@@ -383,14 +422,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // Dispatch for ambient probe (slot 0) — always computed from world origin
         _swDispatch.Restart();
         _debugProbePos = Vector3.zero;   // probe 0 (ambient) lives at the origin
-        DispatchForProbe(0, Vector3.zero);
-
-        // Dispatch once per baked probe; fall back to origin if positions are unavailable
-        for (int i = 0; i < bakedCount; i++)
+        for (int p = 0; p < probeCount; p++)
         {
-            Vector3 pos = (positions != null && i < positions.Length) ? positions[i] : Vector3.zero;
-            if (i + 1 == debugProbeIndex) _debugProbePos = pos;   // remember for the PNG filename
-            DispatchForProbe(i + 1, pos);
+            if (p == debugProbeIndex) _debugProbePos = probePos[p];   // remember for the filename
+            DispatchForProbe(p, probePos[p], UsesPerProbe ? p : 0);
         }
         _swDispatch.Stop();
 
@@ -426,18 +461,19 @@ public class EnvironmentSHUpdater : MonoBehaviour
         double dispatchS = _swDispatch.Elapsed.TotalSeconds;
         double readbackS = _swReadback.Elapsed.TotalSeconds;
         double totalS    = _swTotal.Elapsed.TotalSeconds;
-        int    samples   = (method == ProjectionMethod.ImportanceSampling) ? numSamples : 0;
-        int candidates   = (method == ProjectionMethod.ImportanceSampling) ? numCandidates : 0;
-        string impFunc   = (method == ProjectionMethod.ImportanceSampling) ? importanceFunction.ToString() : "N/A";
+        int    samples   = UsesSampling ? numSamples : 0;
+        int    cands     = UsesSampling ? EffectiveCandidates : 0;
+        string impFunc   = UsesSampling ? importanceFunction.ToString() : "N/A";
+        string mode      = ModeTag();
 
-        Debug.Log($"[EnvironmentSHUpdater] SH updated ({method}/{impFunc}) — Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
+        Debug.Log($"[EnvironmentSHUpdater] SH updated ({mode}/{impFunc}) — " +
+                  $"Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
                   $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
 
-        // InvariantCulture forces '.' as the decimal separator; on Quest the device
-        // locale may default to ',', which would corrupt the CSV columns.
-        File.AppendAllText(_profileLogPath, string.Format(System.Globalization.CultureInfo.InvariantCulture,
+        File.AppendAllText(_profileLogPath, string.Format(CultureInfo.InvariantCulture,
             "{0},{1},{2},{3},{4},{5},{6},{7:F6},{8:F6},{9:F6},{10:F6}\n",
-            Time.frameCount, method, impFunc, bakedCount + 1, samples, candidates, mipLevel, buildS, dispatchS, readbackS, totalS));
+            Time.frameCount, mode, impFunc, probeCount, samples, cands, mipLevel,
+            buildS, dispatchS, readbackS, totalS));
 
         // 8. Dump the debug map to disk
         if (debugDiffuseMap)
@@ -451,10 +487,11 @@ public class EnvironmentSHUpdater : MonoBehaviour
         }
     }
 
-    private void DispatchForProbe(int probeIndex, Vector3 position)
+    private void DispatchForProbe(int probeIndex, Vector3 position, int distSlot)
     {
         computeShader.SetVector("_ProbePosition", position);
         computeShader.SetInt   ("_ProbeIndex",    probeIndex);
+        computeShader.SetInt   ("_DistributionIndex", distSlot);
         computeShader.Dispatch (_activeKernel, 1, 1, 1);
     }
 
@@ -496,11 +533,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         var ic = System.Globalization.CultureInfo.InvariantCulture;
         Vector3 p = _debugProbePos;
-        string posStr = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
-        // Sample count only applies to importance sampling; omit it for FullScan.
-        string samplesStr = (method == ProjectionMethod.ImportanceSampling) ? $"_N={numSamples}_M={numCandidates}" : "";
-        // string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.png";
-        string fileName = $"SHProbe_idx{debugProbeIndex}_{method}{samplesStr}_{posStr}.exr";
+        string posStr    = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
+        string paramsStr = UsesSampling ? $"_N={numSamples}_M={EffectiveCandidates}_{importanceFunction}" : "";
+        string fileName  = $"SHProbe_idx{debugProbeIndex}_{ModeTag()}{paramsStr}_mip{mipLevel}_{posStr}.exr";
 
         #if UNITY_EDITOR
                 string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
@@ -536,7 +571,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Directory.CreateDirectory(dir);
  
         var    ic  = CultureInfo.InvariantCulture;
-        string tag = $"P{debugProbeIndex}_{importanceFunction}_N{numSamples}_M{numCandidates}_mip{mipLevel}_{W}x{H}";
+        string tag = $"P{debugProbeIndex}_{ModeTag()}_{importanceFunction}_N{numSamples}_M{EffectiveCandidates}_mip{mipLevel}_{W}x{H}";
  
         // 1. sampled texels: position, hit count, importance value
         string samplesFile = $"Samples_{tag}.csv";
@@ -568,12 +603,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
         if (_sampleCountBuffer != null && _dumpW == mipW && _dumpH == mipH) return;
  
         _sampleCountBuffer?.Release();
-        _importanceMapBuffer?.Release();
  
         int n = mipW * mipH;
-        _sampleCountBuffer   = new ComputeBuffer(n, sizeof(uint));
-        _importanceMapBuffer = new ComputeBuffer(n, sizeof(float));
- 
+        _sampleCountBuffer   = new ComputeBuffer(n, sizeof(uint)); 
         _sampleCountRaw   = new uint[n];
         _sampleCountZeros = new uint[n];          // cached zero-fill used to clear the histogram
         _importanceRaw    = new float[n];
@@ -582,39 +614,76 @@ public class EnvironmentSHUpdater : MonoBehaviour
     }
 
 
-    // Builds the PBRT-style Distribution2D (luminance × sinθ) for the current
+    // Shared: Builds the PBRT-style Distribution2D (luminance × sinθ) for the current
     // env map at the active mip level. Two passes: per-row conditional CDFs
     // (one thread per row), then the marginal CDF (single thread). Shared by
     // every probe in this update.
-    private void BuildLuminanceDistribution(int mipW, int mipH)
+    // PerProbeDistribution: then runs one extra pass per probe
+    private void BuildDistributions(int mipH, Vector3[] probePos)
     {
-        // Pass 1 — conditional CDF along u, one thread per row
+        int groups = Mathf.CeilToInt(mipH / 64f);   // both build kernels are [numthreads(64,1,1)]
+
         computeShader.SetTexture(_kernelBuildCond, "_EquirectMap",  _currentEnvTex);
         computeShader.SetBuffer (_kernelBuildCond, "_CondCdf",      _condCdfBuffer);
         computeShader.SetBuffer (_kernelBuildCond, "_MarginalFunc", _marginalFuncBuffer);
-        int groups = Mathf.CeilToInt(mipH / 64f); // kernel uses [numthreads(64,1,1)]
-        computeShader.Dispatch(_kernelBuildCond, groups, 1, 1);
-
-        // Pass 2 — marginal CDF along v, single thread
+        computeShader.SetBuffer (_kernelBuildCond, "_ImportanceMap", _importanceMapBuffer);
         computeShader.SetBuffer(_kernelBuildMarg, "_MarginalFunc", _marginalFuncBuffer);
         computeShader.SetBuffer(_kernelBuildMarg, "_MarginalCdf",  _marginalCdfBuffer);
-        computeShader.Dispatch(_kernelBuildMarg, 1, 1, 1);
+
+        // Shared distribution → slot 0, compute importance map
+        computeShader.SetInt("_DistributionIndex", 0);
+        computeShader.Dispatch(_kernelBuildCond, groups, 1, 1);  // Pass 1 — conditional CDF along u, one thread per row    
+
+        if (!UsesPerProbe)
+        {
+            computeShader.Dispatch(_kernelBuildMarg, 1, 1, 1);       // Pass 2 — marginal CDF along v, single thread
+            
+            return;
+        }
+
+        // One distrib per probe - geom folded into importance function
+        computeShader.SetBuffer(_kernelBuildProbeCond, "_CondCdf",       _condCdfBuffer);
+        computeShader.SetBuffer(_kernelBuildProbeCond, "_MarginalFunc",  _marginalFuncBuffer);
+        computeShader.SetBuffer(_kernelBuildProbeCond, "_ImportanceMap", _importanceMapBuffer);
+
+        for (int p = 0; p < probePos.Length; p++)
+        {
+            computeShader.SetVector("_ProbePosition", probePos[p]);
+            computeShader.SetInt("_DistributionIndex", p);
+
+            computeShader.Dispatch(_kernelBuildProbeCond, groups, 1, 1);
+            computeShader.Dispatch(_kernelBuildMarg, 1, 1, 1);
+        }
+
     }
 
     // Sizes the three CDF buffers to the mip dimensions and only rebuilds when they change.
-    private void EnsureDistributionBuffers(int mipW, int mipH)
+    private void EnsureDistributionBuffers(int mipW, int mipH, int slots)
     {
-        if (_condCdfBuffer != null && _distW == mipW && _distH == mipH) return;
+        if (_condCdfBuffer != null && _distW == mipW && _distH == mipH && _distributionIndex == slots) return;
 
-        _condCdfBuffer?.Release();
-        _marginalCdfBuffer?.Release();
-        _marginalFuncBuffer?.Release();
+        ReleaseDistributionBuffers();
 
-        _condCdfBuffer      = new ComputeBuffer(mipH * (mipW + 1), sizeof(float)); // per-row CDF, W+1 entries each
-        _marginalCdfBuffer  = new ComputeBuffer(mipH + 1,          sizeof(float)); // CDF over rows
-        _marginalFuncBuffer = new ComputeBuffer(mipH,              sizeof(float)); // per-row integrals
-        _distW = mipW;
-        _distH = mipH;
+        _condCdfBuffer       = new ComputeBuffer(slots * mipH * (mipW + 1), sizeof(float)); // per-row CDF, W+1 entries each
+        _marginalCdfBuffer   = new ComputeBuffer(slots * (mipH + 1),        sizeof(float)); // CDF over rows
+        _marginalFuncBuffer  = new ComputeBuffer(slots * mipH,              sizeof(float)); // per-row integrals
+        _importanceMapBuffer = new ComputeBuffer(mipW * mipH,               sizeof(float)); // probe-independent, single copy
+        _distW = mipW; 
+        _distH = mipH; 
+        _distributionIndex = slots;
+
+        float mb = (_condCdfBuffer.count + _marginalCdfBuffer.count +
+                    _marginalFuncBuffer.count + _importanceMapBuffer.count) * 4f / (1024f * 1024f);
+        Debug.Log($"[EnvironmentSHUpdater] Distribution buffers: {slots} slot(s) at {mipW}x{mipH} — {mb:F2} MB");
+    }
+
+    private void ReleaseDistributionBuffers()
+    {
+        _condCdfBuffer?.Release();       _condCdfBuffer       = null;
+        _marginalCdfBuffer?.Release();   _marginalCdfBuffer   = null;
+        _marginalFuncBuffer?.Release();  _marginalFuncBuffer  = null;
+        _importanceMapBuffer?.Release(); _importanceMapBuffer = null;
+        _distW = _distH = _distributionIndex = 0;
     }
 
     // -----------------------------------------------------------------------
@@ -653,10 +722,6 @@ public class EnvironmentSHUpdater : MonoBehaviour
             sh[0, coeff] = raw[offset + coeff * 3 + 0]; // R
             sh[1, coeff] = raw[offset + coeff * 3 + 1]; // G
             sh[2, coeff] = raw[offset + coeff * 3 + 2]; // B
-
-            // sh[0, coeff] = 0; // R
-            // sh[1, coeff] = 0; // G
-            // sh[2, coeff] = 0; // B
         }
         return sh;
     }
