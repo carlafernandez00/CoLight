@@ -5,7 +5,9 @@
 
 #pragma kernel ProjectEquirectToSH        // Full-scan quadrature (deterministic, every texel)
 #pragma kernel ProjectEquirectToSH_IS     // Monte Carlo, luminance importance sampling
+#pragma kernel ProjectEquirectToSH_RIS    // Monte Carlo + probe-aware resampling (M candidates)
 #pragma kernel BuildConditionalCDF        // Build per-row conditional CDF (u | v) + row integrals
+#pragma kernel BuildProbeConditionalCDF   // Per-probe distribution: same, with geom folded in
 #pragma kernel BuildMarginalCDF           // Fold row integrals into the marginal CDF (v)
 
 #pragma multi_compile _ DEBUG_DIFFUSE_MAP           // Debug diffuse-map paint is compiled in ONLY when DEBUG_DIFFUSE_MAP
@@ -23,6 +25,7 @@ int                 _ProbeIndex;            // Probe slot: coefficients written 
 int                 _NumSamples;            // (Importance sampling only) number of Monte Carlo samples per probe
 int                 _ImportanceFunction;    // (Importance sampling only) 0 = luminance, 1 = color aware, 2 = uniform (weight 1)  
 int                 _NumCandidates;         // (Importance sampling only) M candidates resampled per output sample
+int                 _DistributionIndex;     // distribution slot to build into / sample from
 
 // OUTPUT
 // 9 SH coefficients per probe, one float3 (RGB) per coefficient -> buffer must have (_ProbeIndex + 1) * 9 elements
@@ -37,16 +40,15 @@ int _DebugProbeIndex;   // probe for which the debug map is written
 // DEBUG IMPORTANCE SAMPLING DISTRIBUTION (optional)
 #ifdef DEBUG_IMPORTANCE_SAMPLING
 RWStructuredBuffer<uint>   _SampleCount;     // how many times each texel was picked
-RWStructuredBuffer<float>  _ImportanceMap;   // importance function value per texel
 #endif
+RWStructuredBuffer<float>  _ImportanceMap;   // importance function value per texel: W*H floats
+
 
 // LUMINANCE DISTRIBUTION (importance sampling)
-// PBRT-style piecewise-constant Distribution2D over the (u,v) unit square,
-// weighted by luminance(texel) * sin(theta) so bright regions AND the equirect
-// distortion are both accounted for. Dimensions are the mip-level dims (W x H).
-RWStructuredBuffer<float> _CondCdf;       // per-row normalized CDF along u
-RWStructuredBuffer<float> _MarginalFunc;  // per-row integral (unnormalized) = sum over u of func
-RWStructuredBuffer<float> _MarginalCdf;   // normalized CDF along v
+// PBRT-style piecewise-constant Distribution2D over the (u,v) unit square
+RWStructuredBuffer<float> _CondCdf;       // per-row normalized CDF along u -> [(s*H + y) * (W+1) + x ], for slot s
+RWStructuredBuffer<float> _MarginalFunc;  // per-row integral (unnormalized) = sum over u of func -> [s*H + y],  for slot s
+RWStructuredBuffer<float> _MarginalCdf;   // normalized CDF along v -> [s*(H+1) + y], for slot s
 
 
 // L2 SPHERICAL HARMONICS BASIS FUNCTIONS Y_i(dir)
@@ -77,7 +79,7 @@ float SH_Y2p2(float3 d)  { return 0.546274f * (d.x * d.x - d.y * d.y); }        
 #define IMPORTANCE_COLOR     1
 #define IMPORTANCE_UNIFORM   2
 
-// Importance sampling max candidates
+// Resampling importance sampling max candidates
 #define MAX_CANDIDATES 24
 groupshared float gCandidatesGeom[MAX_CANDIDATES][NUM_THREADS];
 
@@ -271,6 +273,21 @@ float ImportanceValue(float3 color)
     else return 1.0f;                           
 }
 
+// Normalize the row CDF to [0,1]. Empty (black) rows fall back to uniform
+// so the binary search and pdf reconstruction stay well-defined.
+void NormalizeRow(int cbase, int W, float acc)
+{
+    if (acc > 0.0f)
+    {
+        float inv = 1.0f / acc;
+        for (int xn = 1; xn <= W; xn++) _CondCdf[cbase + xn] *= inv;
+    }
+    else
+    {
+        for (int xu = 1; xu <= W; xu++) _CondCdf[cbase + xu] = (float)xu / (float)W;
+    } 
+}
+
 // One thread per row y. Walks that row along u, accumulating importance
 // (luminance * sinθ) into an un-normalized running sum, then normalizes it to
 // a [0,1] CDF. The row's total importance is stored in _MarginalFunc[y].
@@ -299,26 +316,57 @@ void BuildConditionalCDF(uint3 id : SV_DispatchThreadID)
 
         acc += func;
         _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
-        
-        // DEBUG IMPORTANCE SAMPLING: store the importance function value for each texel
-        #ifdef DEBUG_IMPORTANCE_SAMPLING
-            _ImportanceMap[y * W + x] = imp;
-        #endif
+        _ImportanceMap[y * W + x] = imp;
     }
 
     _MarginalFunc[y] = acc;                                  // row integral (drives marginal)
 
-    // Normalize the row CDF to [0,1]. Empty (black) rows fall back to uniform
-    // so the binary search and pdf reconstruction stay well-defined.
-    if (acc > 0.0f)
+    NormalizeRow(cbase, W, acc);
+}
+
+// Per-probe distribution. same structure, but sample importance from the map, not the texture
+[numthreads(NUM_THREADS, 1, 1)]
+void BuildProbeConditionalCDF(uint3 id : SV_DispatchThreadID)
+{
+    int W = max(1, _TexWidth  >> _MipLevel);
+    int H = max(1, _TexHeight >> _MipLevel);
+    int y = (int)id.x;
+    if (y >= H) return;
+
+    // uv → spherical angles 
+    float v        = (y + 0.5f) / (float)H;
+    float theta    = (1.0f - v) * PI;
+    float sinTheta = sin(theta);
+    float R        = _EnvSphereRadius;
+
+
+    int cbase = (_DistributionIndex * H + y) * (W + 1);
+    _CondCdf[cbase] = 0.0f;
+
+    float acc = 0.0f;
+    for (int x = 0; x < W; x++)
     {
-        float inv = 1.0f / acc;
-        for (int xn = 1; xn <= W; xn++) _CondCdf[cbase + xn] *= inv;
+        // uv → spherical angles 
+        float u      = (x + 0.5) / (float)W;
+        float phi    = (u - 0.5f) * 2.0f * PI;
+        float3 dir = float3(
+            sinTheta * sin(phi),     
+            cos(theta),             
+            sinTheta * cos(phi)     
+        );
+
+        float3 dirProbe;
+        float  geom = ProbeGeom(dir, _ProbePosition, R, dirProbe);
+        
+        // importance = luminance · sinθ · geom
+        float  func = _ImportanceMap[y * W + x] * sinTheta * geom;   
+
+        acc += func;
+        _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
     }
-    else
-    {
-        for (int xu = 1; xu <= W; xu++) _CondCdf[cbase + xu] = (float)xu / (float)W;
-    }
+
+    _MarginalFunc[_DistributionIndex * H + y] = acc;         // row integral (drives marginal)
+    NormalizeRow(cbase, W, acc);
 }
 
 // Single thread. Folds the per-row integrals (_MarginalFunc) into the marginal
@@ -329,22 +377,25 @@ void BuildMarginalCDF(uint3 id : SV_DispatchThreadID)
 {
     int H = max(1, _TexHeight >> _MipLevel);
 
-    _MarginalCdf[0] = 0.0f;
+    int cbase = _DistributionIndex * (H + 1);
+    int fbase = _DistributionIndex * H;
+
+    _MarginalCdf[cbase] = 0.0f;
     float acc = 0.0f;
     for (int y = 0; y < H; y++)
     {
-        acc += _MarginalFunc[y];
-        _MarginalCdf[y + 1] = acc;
+        acc += _MarginalFunc[fbase + y];
+        _MarginalCdf[cbase + y + 1] = acc;
     }
 
     if (acc > 0.0f)
     {
         float inv = 1.0f / acc;
-        for (int yn = 1; yn <= H; yn++) _MarginalCdf[yn] *= inv;
+        for (int yn = 1; yn <= H; yn++) _MarginalCdf[cbase + yn] *= inv;
     }
     else
     {
-        for (int yu = 1; yu <= H; yu++) _MarginalCdf[yu] = (float)yu / (float)H;
+        for (int yu = 1; yu <= H; yu++) _MarginalCdf[cbase + yu] = (float)yu / (float)H;
     }
 }
 
@@ -366,7 +417,7 @@ float2 Hammersley(uint i, uint N) { return float2((float)i / (float)N, radicalIn
 
 
 // ---------------------------------------------------------------------------
-// Random
+// Random distribution
 // ---------------------------------------------------------------------------
 uint WangHash(uint s)
 {
@@ -383,6 +434,81 @@ float2 Random2(uint i, uint seed)
     uint h2 = WangHash(h1);
     return float2(h1 * 2.3283064365386963e-10f,
                   h2 * 2.3283064365386963e-10f);
+}
+// ---------------------------------------------------------------------------
+// Importance Sampling Helpers
+// ---------------------------------------------------------------------------
+
+// Adds one weighted sample to the SH accumulator.
+void AccumulateSH(uint t, float3 color, float3 dirProbe, float w)
+{
+    gSH[t][0] += color * SH_Y00()              * w;
+    gSH[t][1] += color * SH_Y1n1(dirProbe) * w;
+    gSH[t][2] += color * SH_Y10 (dirProbe) * w;
+    gSH[t][3] += color * SH_Y1p1(dirProbe) * w;
+    gSH[t][4] += color * SH_Y2n2(dirProbe) * w;
+    gSH[t][5] += color * SH_Y2n1(dirProbe) * w;
+    gSH[t][6] += color * SH_Y20 (dirProbe) * w;
+    gSH[t][7] += color * SH_Y2p1(dirProbe) * w;
+    gSH[t][8] += color * SH_Y2p2(dirProbe) * w;
+    gWeight[t] += w;  // for normalization -> Σw estimates · ∫dΩ_probe = 4π 
+}
+
+// Halving reduction, normalization and option debug paint
+void ReduceAndWrite(uint threadIndex)
+{
+    // Halving reduction: 64 accumulators → slot [0]                                                                      
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint stride = NUM_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIndex < stride)
+        {
+            [unroll] for (int c = 0; c < 9; c++) gSH[threadIndex][c] += gSH[threadIndex + stride][c];
+            gWeight[threadIndex] += gWeight[threadIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Normalization and write-out (thread 0 only)  
+    if (threadIndex == 0)
+    {
+        // float normFactor = (4.0f * PI) / gWeight[0];  // ratio (self-normalized) estimator
+        float normFactor = 1.0f / (float)max(1, _NumSamples);
+        [unroll] for (int j = 0; j < 9; j++) gSH[0][j] *= normFactor;
+
+        int outBase = _ProbeIndex * 9;
+        [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[outBase + i] = gSH[0][i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+
+    // when DEBUG_DIFFUSE_MAP, write the SH coefficients just computed for the ambient probe into _DiffuseMap
+    #ifdef DEBUG_DIFFUSE_MAP
+        if (_ProbeIndex == _DebugProbeIndex)
+        {
+            int total = _OutWidth * _OutHeight;
+            for (int p = (int)threadIndex; p < total; p += NUM_THREADS)
+            {
+                int   px = p % _OutWidth;
+                int   py = p / _OutWidth;
+                float u  = (px + 0.5f) / (float)_OutWidth;
+                float v  = (py + 0.5f) / (float)_OutHeight;
+                float3 n = DirFromUV(u, v);
+
+                float3 c = gSH[0][0] * SH_Y00()
+                        + gSH[0][1] * SH_Y1n1(n)
+                        + gSH[0][2] * SH_Y10 (n)
+                        + gSH[0][3] * SH_Y1p1(n)
+                        + gSH[0][4] * SH_Y2n2(n)
+                        + gSH[0][5] * SH_Y2n1(n)
+                        + gSH[0][6] * SH_Y20 (n)
+                        + gSH[0][7] * SH_Y2p1(n)
+                        + gSH[0][8] * SH_Y2p2(n);
+
+                _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
+            }
+        }
+    #endif // DEBUG_DIFFUSE_MAP
 }
 
 // Sample Candidate sturct
@@ -405,28 +531,31 @@ Candidate DrawCandidate(uint sampleIndex, uint TOTAL, int W, int H)
 
     // 2: Inverse-CDF sampling of the 2D luminance distribution: PBRT Distribution2D sampling algorithm
     // Pick a row v from the marginal CDF (binary search) 
+    int mbase = _DistributionIndex * (H + 1);
     int lo = 0, hi = H;
     [loop] while (lo + 1 < hi) { 
         int mid = (lo + hi) >> 1;           // midpoint of the current search window
-        if (_MarginalCdf[mid] <= xi.x)      
+        if (_MarginalCdf[mbase + mid] <= xi.x)      
             lo = mid;                       // if lower or eq than xi.x, look into higher rows
         else                       
             hi = mid;                       // look into lower rows 
     }
     int   y      = lo;
-    float m0     = _MarginalCdf[y];
-    float m1     = _MarginalCdf[y + 1];
+    float m0     = _MarginalCdf[mbase + y];
+    float m1     = _MarginalCdf[mbase + y + 1];
     float mSlope = m1 - m0;                 // width of the boundaries = row "y" probability
     float pdfV   = (float)H * mSlope;       // marginal density (over [0,1])
 
     // Pick a column u from that row's conditional CDF 
-    int cbase = y * (W + 1);
+    int cbase = (_DistributionIndex * H + y) * (W + 1);
     int lo2 = 0, hi2 = W;
     [loop] while (lo2 + 1 < hi2) 
     { 
         int mid2 = (lo2 + hi2) >> 1; 
-        if (_CondCdf[cbase + mid2] <= xi.y) lo2 = mid2; 
-        else hi2 = mid2; 
+        if (_CondCdf[cbase + mid2] <= xi.y) 
+            lo2 = mid2; 
+        else 
+            hi2 = mid2; 
     }
     int   x      = lo2;
     float c0     = _CondCdf[cbase + x];
@@ -467,14 +596,10 @@ Candidate DrawCandidate(uint sampleIndex, uint TOTAL, int W, int H)
 }
 
 // ===========================================================================
-// Importance-sampling projection kernel
-// One thread group per probe (dispatch (1,1,1) per probe, like the full scan).
-// Each thread draws a strided subset of the N Hammersley samples, maps each
-// through the luminance distribution to a direction, and accumulates the
-// self-normalized Monte Carlo SH estimator.
+// Resampling Importance-sampling projection kernel
 // ===========================================================================
 [numthreads(NUM_THREADS, 1, 1)]
-void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_GroupThreadID)
+void ProjectEquirectToSH_RIS(uint3 groupID : SV_GroupID, uint threadIndex : SV_GroupThreadID)
 {
     [unroll] for (int k = 0; k < 9; k++) gSH[threadIndex][k] = float3(0, 0, 0);
     gWeight[threadIndex] = 0.0f;
@@ -489,11 +614,11 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
     // Monte Carlo loop: each thread draws a strided subset of the N Hammersley samples
     for (uint s = threadIndex; s < N; s += NUM_THREADS)
     {
-        // 1: Generate M candidates and choose by geometrical weight the winning candidate
+        // Generate M candidates and choose by geometrical weight the winning candidate
         float geomSum = 0.0f;
         [loop] for (uint m = 0; m < M; m++)
         {
-            Candidate candidate = DrawCandidate(s+m*N, TOTAL, W, H);
+            Candidate candidate = DrawCandidate(s*M+m, TOTAL, W, H);
             gCandidatesGeom[m][threadIndex] = candidate.geom;
             geomSum += candidate.geom;
         }
@@ -517,7 +642,7 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         }
 
         // Regenerate the winning sample
-        Candidate win = DrawCandidate(s + mWin * N, TOTAL, W, H);
+        Candidate win = DrawCandidate(s * M + mWin, TOTAL, W, H);
 
         #ifdef DEBUG_IMPORTANCE_SAMPLING
             if (_ProbeIndex == _DebugProbeIndex)
@@ -525,72 +650,50 @@ void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_Gr
         #endif
 
         
-        // 2: accumulate the estimator  f(ω)/p(ω)
+        // accumulate the estimator  f(ω)/p(ω)
         float  w        = geomSum / (win.pOmega * (float)M);               // sample weight                                                   
         float3 color    = _EquirectMap.SampleLevel(sampler_EquirectMap, win.uv, _MipLevel).rgb;  // environment color at this direction
 
-        gSH[threadIndex][0] += color * SH_Y00()              * w;
-        gSH[threadIndex][1] += color * SH_Y1n1(win.dirProbe) * w;
-        gSH[threadIndex][2] += color * SH_Y10 (win.dirProbe) * w;
-        gSH[threadIndex][3] += color * SH_Y1p1(win.dirProbe) * w;
-        gSH[threadIndex][4] += color * SH_Y2n2(win.dirProbe) * w;
-        gSH[threadIndex][5] += color * SH_Y2n1(win.dirProbe) * w;
-        gSH[threadIndex][6] += color * SH_Y20 (win.dirProbe) * w;
-        gSH[threadIndex][7] += color * SH_Y2p1(win.dirProbe) * w;
-        gSH[threadIndex][8] += color * SH_Y2p2(win.dirProbe) * w;
-        gWeight[threadIndex] += w;
+        AccumulateSH(threadIndex, color, win.dirProbe, w);
     }
 
-    // 3: Halving reduction: 64 accumulators → slot [0]                                                                      
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint stride = NUM_THREADS / 2; stride > 0; stride >>= 1)
-    {
-        if (threadIndex < stride)
-        {
-            [unroll] for (int c = 0; c < 9; c++) gSH[threadIndex][c] += gSH[threadIndex + stride][c];
-            gWeight[threadIndex] += gWeight[threadIndex + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    // 4: normalization and write-out (thread 0 only)  
-    if (threadIndex == 0)
-    {
-        float normFactor = (4.0f * PI) / gWeight[0];  // ratio (self-normalized) estimator
-        // float normFactor = 1.0f / (float)max(1, _NumSamples);
-        [unroll] for (int j = 0; j < 9; j++) gSH[0][j] *= normFactor;
-
-        int outBase = _ProbeIndex * 9;
-        [unroll] for (int i = 0; i < 9; i++) _SHCoeffs[outBase + i] = gSH[0][i];
-    }
-    GroupMemoryBarrierWithGroupSync();
-    
-
-    // when DEBUG_DIFFUSE_MAP, write the SH coefficients just computed for the ambient probe into _DiffuseMap
-    #ifdef DEBUG_DIFFUSE_MAP
-        if (_ProbeIndex == _DebugProbeIndex)
-        {
-            int total = _OutWidth * _OutHeight;
-            for (int p = (int)threadIndex; p < total; p += NUM_THREADS)
-            {
-                int   px = p % _OutWidth;
-                int   py = p / _OutWidth;
-                float u  = (px + 0.5f) / (float)_OutWidth;
-                float v  = (py + 0.5f) / (float)_OutHeight;
-                float3 n = DirFromUV(u, v);
-
-                float3 c = gSH[0][0] * SH_Y00()
-                        + gSH[0][1] * SH_Y1n1(n)
-                        + gSH[0][2] * SH_Y10 (n)
-                        + gSH[0][3] * SH_Y1p1(n)
-                        + gSH[0][4] * SH_Y2n2(n)
-                        + gSH[0][5] * SH_Y2n1(n)
-                        + gSH[0][6] * SH_Y20 (n)
-                        + gSH[0][7] * SH_Y2p1(n)
-                        + gSH[0][8] * SH_Y2p2(n);
-
-                _DiffuseMap[uint2(px, py)] = float4(c, 1.0f);
-            }
-        }
-    #endif // DEBUG_DIFFUSE_MAP
+    // Halving reduction: 64 accumulators → slot [0], normalization and write-out (thread 0 only)                                                           
+    ReduceAndWrite(threadIndex);
 }
+
+// ===========================================================================
+// Importance-sampling projection kernel
+// ===========================================================================
+[numthreads(NUM_THREADS, 1, 1)]
+void ProjectEquirectToSH_IS(uint3 groupID : SV_GroupID, uint threadIndex : SV_GroupThreadID)
+{
+    [unroll] for (int k = 0; k < 9; k++) gSH[threadIndex][k] = float3(0, 0, 0);
+    gWeight[threadIndex] = 0.0f;
+
+    // Mip-level dims and number of samples (importance sampling)
+    int   W = max(1, _TexWidth  >> _MipLevel);
+    int   H = max(1, _TexHeight >> _MipLevel);
+    uint  N = (uint)max(1, _NumSamples);
+
+    // Monte Carlo loop: each thread draws a strided subset of the N Hammersley samples
+    for (uint s = threadIndex; s < N; s += NUM_THREADS)
+    {
+        // Generate sample
+        Candidate c = DrawCandidate(s, N, W, H);
+
+        #ifdef DEBUG_IMPORTANCE_SAMPLING
+            if (_ProbeIndex == _DebugProbeIndex)
+                InterlockedAdd(_SampleCount[c.texel.y * W + c.texel.x], 1u);     // count how many times this texel was picked
+        #endif
+
+        // accumulate the estimator  f(ω)/p(ω)
+        float  w         = c.geom / c.pOmega;              // Monte Carlo estimator f(w)/p(w)                                                  
+        float3 color     = _EquirectMap.SampleLevel(sampler_EquirectMap, c.uv, _MipLevel).rgb;  // environment color at this direction
+
+        AccumulateSH(threadIndex, color, c.dirProbe, w);
+    }
+
+    // Halving reduction: 64 accumulators → slot [0], normalization and write-out (thread 0 only)                                                           
+    ReduceAndWrite(threadIndex);
+}
+
