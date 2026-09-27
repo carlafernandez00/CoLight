@@ -109,11 +109,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _distW, _distH, _distributionIndex;  // dims the distribution buffers were built for
 
     // Debug Importance Sampling
-    private ComputeBuffer _sampleCountBuffer;  // mipW * mipH uints, counts how many times each texel was sampled
-    private ComputeBuffer _importanceMapBuffer; // mipW * mipH floats, stores the importance function value for each texel
+    private ComputeBuffer _sampleCountBuffer;    // mipW * mipH uints, counts how many times each texel was sampled
+    private ComputeBuffer _sampleDensityBuffer;  // mipW * mipH floats, the sampled density
+    private ComputeBuffer _importanceMapBuffer;  // mipW * mipH floats, stores the importance function value for each texel
     private uint[]        _sampleCountRaw;
     private uint[]        _sampleCountZeros;
-    private float[]       _importanceRaw;
+    private float[]       _densityRaw;
     private int           _dumpW, _dumpH;
     private bool          _sampleDumpWritten;   
 
@@ -205,6 +206,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         ReleaseDistributionBuffers();
 
         _sampleCountBuffer?.Release();  _sampleCountBuffer  = null;
+        _sampleDensityBuffer?.Release();  _sampleDensityBuffer = null;
         _dumpW = _dumpH = 0;
 
         if (_diffuseRenderTexture != null) { _diffuseRenderTexture.Release(); _diffuseRenderTexture = null; }
@@ -396,7 +398,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
             } 
 
             _swBuild.Start();
-            BuildDistributions(mipH, probePos);
+            BuildDistributions(mipH, probePos, saveSampleDump);
             _swBuild.Stop();
 
             // Bind the distribution buffers to the sampling kernel
@@ -551,33 +553,35 @@ public class EnvironmentSHUpdater : MonoBehaviour
     }
 
     // Saves the importance sampling data to disk for visualization/debugging. Writes the following files:
-    //   Samples_<imp>_N<n>_mip<m>_<W>x<H>.csv    x,y,count                  (only texels with count > 0)
-    //   Importance_<imp>_mip<m>_<W>x<H>.f32      W*H float32,               (greyscale importance map)    //
-    // Row order matches Unity UV space: index = y*W + x with u = (x+0.5)/W, v = (y+0.5)/H,
+    // Samples_<tag>.csv    x,y,count   (only texels that were sampled)
+    // Density_<tag>.f32    W*H float32 (the function the sampler follows)
+    // tag = P<probe>_<mode>_<importance>_N<n>_M<m>_mip<l>_<W>x<H>_pos(x_y_z)_R<radius>
     private void SaveSampleDumpToDisk()
     {
         if (_sampleCountBuffer == null || _dumpW <= 0 || _dumpH <= 0) return;
- 
+
         int W = _dumpW, H = _dumpH;
- 
+
         _sampleCountBuffer.GetData(_sampleCountRaw);
-        _importanceMapBuffer.GetData(_importanceRaw);
- 
+        _sampleDensityBuffer.GetData(_densityRaw);
+
         #if UNITY_EDITOR
                 string dir = Path.Combine(Application.dataPath, "Debug", "SH_ImportanceSamples");
         #else
                 string dir = Path.Combine(Application.persistentDataPath, "SH_ImportanceSamples");
         #endif
         Directory.CreateDirectory(dir);
- 
-        var    ic  = CultureInfo.InvariantCulture;
-        string tag = $"P{debugProbeIndex}_{ModeTag()}_{importanceFunction}_N{numSamples}_M{EffectiveCandidates}_mip{mipLevel}_{W}x{H}";
- 
-        // 1. sampled texels: position, hit count, importance value
-        string samplesFile = $"Samples_{tag}.csv";
-        var    sb          = new StringBuilder(1 << 16);
+
+        var     ic  = CultureInfo.InvariantCulture;
+        Vector3 p   = _debugProbePos;
+        string  pos = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
+        string  tag = string.Format(ic,
+            "P{0}_{1}_{2}_N{3}_M{4}_mip{5}_{6}x{7}_{8}_R{9:F2}",
+            debugProbeIndex, ModeTag(), importanceFunction, numSamples,
+            EffectiveCandidates, mipLevel, W, H, pos, envSphereRadius);
+
+        var sb = new StringBuilder(1 << 16);
         sb.Append("x,y,count\n");
- 
         for (int y = 0; y < H; y++)
         {
             int row = y * W;
@@ -588,13 +592,13 @@ public class EnvironmentSHUpdater : MonoBehaviour
                 sb.AppendFormat(ic, "{0},{1},{2}\n", x, y, cnt);
             }
         }
-        File.WriteAllText(Path.Combine(dir, samplesFile), sb.ToString());
- 
-        // 2. greyscale importance map (raw float32, W*H) 
-        string impFile   = $"Importance_{tag}.f32";
-        var    impBytes  = new byte[W * H * sizeof(float)];
-        Buffer.BlockCopy(_importanceRaw, 0, impBytes, 0, impBytes.Length);
-        File.WriteAllBytes(Path.Combine(dir, impFile), impBytes);
+        File.WriteAllText(Path.Combine(dir, $"Samples_{tag}.csv"), sb.ToString());
+
+        var bytes = new byte[W * H * sizeof(float)];
+        Buffer.BlockCopy(_densityRaw, 0, bytes, 0, bytes.Length);
+        File.WriteAllBytes(Path.Combine(dir, $"Density_{tag}.f32"), bytes);
+
+        Debug.Log($"[EnvironmentSHUpdater] Sample dump: {tag}");
     }
  
     // Sizes the sample-dump buffers to the mip dimensions and only rebuilds when they change.
@@ -603,12 +607,14 @@ public class EnvironmentSHUpdater : MonoBehaviour
         if (_sampleCountBuffer != null && _dumpW == mipW && _dumpH == mipH) return;
  
         _sampleCountBuffer?.Release();
+        _sampleDensityBuffer?.Release();
  
         int n = mipW * mipH;
         _sampleCountBuffer   = new ComputeBuffer(n, sizeof(uint)); 
+        _sampleDensityBuffer = new ComputeBuffer(n, sizeof(float));
         _sampleCountRaw   = new uint[n];
         _sampleCountZeros = new uint[n];          // cached zero-fill used to clear the histogram
-        _importanceRaw    = new float[n];
+        _densityRaw    = new float[n];
         _dumpW = mipW;
         _dumpH = mipH;
     }
@@ -619,7 +625,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     // (one thread per row), then the marginal CDF (single thread). Shared by
     // every probe in this update.
     // PerProbeDistribution: then runs one extra pass per probe
-    private void BuildDistributions(int mipH, Vector3[] probePos)
+    private void BuildDistributions(int mipH, Vector3[] probePos, bool dumping)
     {
         int groups = Mathf.CeilToInt(mipH / 64f);   // both build kernels are [numthreads(64,1,1)]
 
@@ -629,6 +635,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetBuffer (_kernelBuildCond, "_ImportanceMap", _importanceMapBuffer);
         computeShader.SetBuffer(_kernelBuildMarg, "_MarginalFunc", _marginalFuncBuffer);
         computeShader.SetBuffer(_kernelBuildMarg, "_MarginalCdf",  _marginalCdfBuffer);
+        if (dumping) computeShader.SetBuffer(_kernelBuildCond, "_SampleDensity", _sampleDensityBuffer);
+
 
         // Shared distribution → slot 0, compute importance map
         computeShader.SetInt("_DistributionIndex", 0);
@@ -645,6 +653,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetBuffer(_kernelBuildProbeCond, "_CondCdf",       _condCdfBuffer);
         computeShader.SetBuffer(_kernelBuildProbeCond, "_MarginalFunc",  _marginalFuncBuffer);
         computeShader.SetBuffer(_kernelBuildProbeCond, "_ImportanceMap", _importanceMapBuffer);
+        if (dumping) computeShader.SetBuffer(_kernelBuildProbeCond, "_SampleDensity", _sampleDensityBuffer);
+    
 
         for (int p = 0; p < probePos.Length; p++)
         {
