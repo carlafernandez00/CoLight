@@ -40,7 +40,9 @@ int _DebugProbeIndex;   // probe for which the debug map is written
 // DEBUG IMPORTANCE SAMPLING DISTRIBUTION (optional)
 #ifdef DEBUG_IMPORTANCE_SAMPLING
 RWStructuredBuffer<uint>   _SampleCount;     // how many times each texel was picked
+RWStructuredBuffer<float>  _SampleDensity;   // the function the sampler actually follows
 #endif
+
 RWStructuredBuffer<float>  _ImportanceMap;   // importance function value per texel: W*H floats
 
 
@@ -317,6 +319,10 @@ void BuildConditionalCDF(uint3 id : SV_DispatchThreadID)
         acc += func;
         _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
         _ImportanceMap[y * W + x] = imp;
+
+        #ifdef DEBUG_IMPORTANCE_SAMPLING
+            _SampleDensity[y * W + x] = func;        // imp · sinθ
+        #endif
     }
 
     _MarginalFunc[y] = acc;                                  // row integral (drives marginal)
@@ -363,6 +369,11 @@ void BuildProbeConditionalCDF(uint3 id : SV_DispatchThreadID)
 
         acc += func;
         _CondCdf[cbase + x + 1] = acc;                       // un-normalized cumulative
+    
+        #ifdef DEBUG_IMPORTANCE_SAMPLING
+            if (_DistributionIndex == _DebugProbeIndex)
+                _SampleDensity[y * W + x] = func;    // imp · sinθ · geom
+        #endif
     }
 
     _MarginalFunc[_DistributionIndex * H + y] = acc;         // row integral (drives marginal)

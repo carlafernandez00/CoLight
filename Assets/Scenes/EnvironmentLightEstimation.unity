@@ -509,12 +509,12 @@ MonoBehaviour:
   mipLevel: 0
   method: 1
   importanceFunction: 1
-  probeAware: 1
+  probeAware: 2
   numSamples: 512
   numCandidates: 16
-  debugDiffuseMap: 0
-  debugProbeIndex: 4
-  debugImportanceSampling: 0
+  debugDiffuseMap: 1
+  debugProbeIndex: 8
+  debugImportanceSampling: 1
   dumpOnce: 1
 --- !u!1 &303377057
 GameObject:
