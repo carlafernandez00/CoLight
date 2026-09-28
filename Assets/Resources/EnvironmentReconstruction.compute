@@ -25,6 +25,7 @@ RWStructuredBuffer<uint> _DepthAccumulation;  // per-texel accumulation of depth
 int _OutWidth;
 int _OutHeight;
 
+
 // COLOR CAMERA (Meta PassthroughCameraAccess) 
 float4x4 _ColorProjectionMatrix;    // color camera projection matrix
 float2   _ColorFocal;               // intrinsics focal length (sensor px)
@@ -46,6 +47,15 @@ Texture2DArray<float> _EnvironmentDepthTexture;          // NON-linear depth in 
 SamplerState          sampler_EnvironmentDepthTexture;   // sampler for the depth texture array
 
 static const float DEPTH_MARGIN = 0.03f;   // ignore the noisy border of the depth frame
+
+int   _DepthWidth;      // depth map resolution (for scatter dispatch)
+int   _DepthHeight;
+float _SplatRadius;     // 0 = only central texel from the splat
+
+float _EpsNoise;        // m, soroll base del depth
+float _EpsFootprint;    // multiplicador de la petjada angular del texel
+float _TexelAngle;      // PI / _OutHeight, en radians
+int   _AllowRecede;     // 1 = accepta que una superficie s'allunyi
 
 
 // HELPERS:
@@ -76,33 +86,6 @@ uint2 TexelFromDir(float3 D)
     return uint2(x, y);
 }
 
-// Sample the depth texture and convert to world space position (meters). Returns false if the texel is outside the depth camera's FOV
-bool SampleDepthWorld(float4 ndcPos, out float3 worldPoint)
-{
-    worldPoint = float3(0.0f, 0.0f, 0.0f);
-
-    // normalized device coordinates: NDC [-1,1] → UV [0,1]
-    float2 ndcXY = ndcPos.xy / ndcPos.w;
-    float2 uvPos = (ndcXY + 1.0f) * 0.5f; 
-
-    // check if it's inside the camera's view (add margin to avoid artifacts at the edges of the depth texture)
-    if (uvPos.x < DEPTH_MARGIN || uvPos.x > 1.0f - DEPTH_MARGIN || 
-        uvPos.y < DEPTH_MARGIN || uvPos.y > 1.0f - DEPTH_MARGIN) return false;
-
-    
-    float raw_depth = _EnvironmentDepthTexture.SampleLevel(
-                        sampler_EnvironmentDepthTexture, float3(uvPos, 0.0f), 0).r;
-
-    // Project position back to world space using the inverse reprojection matrix
-    float ndcDepth = raw_depth * 2.0f - 1.0f;          // convert to NDC [-1,1] = 2 * depth - 1
-    float4 worldPos = mul(_DepthReprojInverse, float4(ndcXY, ndcDepth, 1.0f));
-
-    if (abs(worldPos.w) < 1e-6f) return false;   // avoid division by zero
-    worldPoint = worldPos.xyz / worldPos.w;
-
-    return true;
-}
-
 // Convert the depth from eye space to linear metric depth in meters
 float LinearDepthMeters(float rawDepth)
 {
@@ -115,6 +98,42 @@ float LinearDepthMeters(float rawDepth)
         return depth_in_meters;
     }
     return -1.0f;
+}
+
+// Sample the depth texture and convert to world space position (meters). Returns false if the texel is outside the depth camera's FOV
+bool SampleDepthWorld(float2 ndcXY, float2 uvPos, out float3 worldPoint)
+{
+    worldPoint = float3(0.0f, 0.0f, 0.0f);
+
+    // check if it's inside the camera's view (add margin to avoid artifacts at the edges of the depth texture)
+    if (uvPos.x < DEPTH_MARGIN || uvPos.x > 1.0f - DEPTH_MARGIN || 
+        uvPos.y < DEPTH_MARGIN || uvPos.y > 1.0f - DEPTH_MARGIN) return false;
+
+    
+    float raw_depth = _EnvironmentDepthTexture.SampleLevel(
+                        sampler_EnvironmentDepthTexture, float3(uvPos, 0.0f), 0).r;
+    
+
+    // Get ray direction of the projection 
+    float4 q0 = mul(_DepthReprojInverse, float4(ndcXY, 0.25f, 1.0f));        // 0.25 and 0.75 instead of 0, 1 so we don't reach the inf value
+    float4 q1 = mul(_DepthReprojInverse, float4(ndcXY, 0.75f, 1.0f));
+    float3 dir = normalize(q1.xyz/q1.w - q0.xyz/q0.w);                       // normalize
+
+    // let's compute the optic axis direction
+    float4 c0 = mul(_DepthReprojInverse, float4(0.0f, 0.0f, 0.25f, 1.0f));   // 0.25 and 0.75 instead of 0, 1 so we don't reach the inf value
+    float4 c1 = mul(_DepthReprojInverse, float4(0.0f, 0.0f, 0.75f, 1.0f));
+    float3 axis = normalize(c1.xyz/c1.w - c0.xyz/c0.w);                      // normalize
+
+    // distance computed with meta linealization
+    float d = LinearDepthMeters(raw_depth);
+    if (d <= 0.0f) return false;
+
+    // d is the distance perpendicular to the camera plane, i.e., the distance along the optic axis
+    // to compute the distance along the ray: d/cos(theta), cos(theta)=dot(dir, axis)
+    float cosT = max(dot(dir, axis), 1e-4f);   
+    worldPoint = _CameraPos + dir * (d / cosT);
+
+    return true;
 }
 
 
@@ -151,8 +170,12 @@ void ReconstructEquirect(uint3 id : SV_DispatchThreadID)
     // check it's in front of the camera -> only half the sphere is visible
     if (ndcDepthCoord.w > 1e-5f)
     {
+        // normalized device coordinates: NDC [-1,1] → UV [0,1]
+        float2 ndcXY = ndcDepthCoord.xy / ndcDepthCoord.w;
+        float2 uvPos = (ndcXY + 1.0f) * 0.5f; 
         float3 worldPoint;
-        if (SampleDepthWorld(ndcDepthCoord, worldPoint))
+
+        if (SampleDepthWorld(ndcXY, uvPos, worldPoint))
         {
             float3 dirFromOrigin = worldPoint - _MapCenter;   // convert to camera space (depth camera is at the origin)
             float depth = length(dirFromOrigin);  
@@ -172,38 +195,55 @@ void ClearDepthAccumulation(uint3 id : SV_DispatchThreadID)
     _DepthAccumulation[id.y * _OutWidth + id.x] = SENTINEL;   // mark as uninitialized
 }
 
-// UPDATE PANORAMAS, STEP 1: Reconstruct the equirectangular depth panorama from the camera, using the per-frame accumulation buffer to average multiple samples per texel
+// UPDATE PANORAMAS, STEP 1: Go through depth map to get the new depth values
 [numthreads(8, 8, 1)]
 void ObtainDepth(uint3 id : SV_DispatchThreadID)
 {
-    if ((int)id.x >= _OutWidth || (int)id.y >= _OutHeight) return;
+    if (id.x >= (uint)_DepthWidth || id.y >= (uint)_DepthHeight) return;
 
-    // 1. Convert from texture coordinate to world space direction 
-    float3 D = DirFromTexel(id.xy);
+    float2 uv = ((float2)id.xy + 0.5f) / float2(_DepthWidth, _DepthHeight); 
+    float2 ndcXY = uv * 2.0f - 1.0f;
 
-    // 2. Compute X = C + d*D and project into the depth camera space
-    float depthScan = _DepthEquirect[id.xy];
+    float3 X;
+    if (!SampleDepthWorld(ndcXY, uv, X)) return;   // get world point
 
-    float4 ndcDepthCoord = (depthScan > 0.0f)                                                      // Check that d > 0
-        ? mul(_DepthReproj, float4(_MapCenter + depthScan * D, 1.0f))
-        : mul(_DepthReproj, float4(D, 0.0f));                                                      // fallback: project the direction itself if no depth is available
-    if (ndcDepthCoord.w <= 1e-5f) return;                                                          // points behind the camera
+    float3 D = X - _MapCenter;                     // D = X - Cs
+    float  r = length(D);
+    if (r <= 0.05f || r >= 9999.0f) return;
 
-    // 3. Get point X' = unprojected(X, depth) in world space. 
-    // From point in the depth camera we can get the world direction and distance to the point to obtain the world position
-    float3 worldPoint;
-    if (!SampleDepthWorld(ndcDepthCoord, worldPoint)) return;  // outside the depth camera's FOV / invalid
+    float3 dir = D / r;
+    uint2  texel   = TexelFromDir(dir);
 
-    // 4. Compute the distance from the map center to the world point
-    float3 dirFromOrigin = worldPoint - _MapCenter;
-    float  depth         = length(dirFromOrigin);
-    if (depth <= 0.0f || depth >= 9999.0f) return;  
-    
-    // 5. Get texel (u', v') from direction and write to the accumulation buffer
-    uint2 texel = TexelFromDir(dirFromOrigin / depth); 
+    if (_SplatRadius < 0.5f)
+    {
+        InterlockedMin(_DepthAccumulation[texel.y * _OutWidth + texel.x], asuint(r));
+        return;
+    }
 
-    // accumulate the minimum depth for this texel
-    InterlockedMin(_DepthAccumulation[texel.y * _OutWidth + texel.x], asuint(depth));   
+    // Equirect texels shrink in longitude towards the poles -> we have to widen the texels depending on sin(theta)
+    float cosT = dir.y; 
+    float sinT2 = saturate(1.0f - cosT * cosT);  // sin2 = 1 - cos2 , saturate to clamp 0, 1 (decimals)
+    float sinT = max(sqrt(sinT2), 0.15f);       // limit
+
+    int   ry   = (int)ceil(_SplatRadius);
+    int   rx   = (int)ceil(_SplatRadius / sinT);
+
+    // let's go over the pixels around ry, rx
+    for (int dy = -ry; dy <= ry; ++dy)
+    {
+        int y = (int)texel.y + dy;
+        if (y < 0 || y >= _OutHeight) continue;
+        for (int dx = -rx; dx <= rx; ++dx)
+        {
+            int x = (int)texel.x + dx;
+            // as the horitzontal texgture is ciclic, if the x is lower than 0 or greater than _OutWidth, 
+            // we have to paint in the other extrem of the texture
+            if      (x < 0)          x += _OutWidth;
+            else if (x >= _OutWidth) x -= _OutWidth;
+
+            InterlockedMin(_DepthAccumulation[y * _OutWidth + x], asuint(r));
+        }
+    }
 }
 
 
@@ -213,25 +253,32 @@ void ResolveDepthAndColor(uint3 id : SV_DispatchThreadID)
 {
     if ((int)id.x >= _OutWidth || (int)id.y >= _OutHeight) return;
 
-    // 1. Read the accumulated depth for this texel
-    uint accumulatedDepthBits = _DepthAccumulation[id.y * _OutWidth + id.x];
-    if (accumulatedDepthBits == SENTINEL) return;                   // no sample this frame, keep old
+    uint bits = _DepthAccumulation[id.y * _OutWidth + id.x];
+    if (bits == SENTINEL) return;               // Not sampled in this frame
 
-    // 2. Update depth panorama with the minimum depth found this frame
-    float depth = asfloat(accumulatedDepthBits);
-    _DepthEquirect[id.xy] = depth;
+    float rNew = asfloat(bits);                 // |D| = |X - Cs| computed
+    float rOld = _DepthEquirect[id.xy];         // Ds stored
 
-    // 3. Update color from the winning depth: get X = C + d*D and project into the color camera
-    float3 worldPoint = _MapCenter + depth * DirFromTexel(id.xy);
-    float3 camSpaceCoord = mul(_ColorProjectionMatrix, float4(worldPoint, 1.0f)).xyz; 
-    if (camSpaceCoord.z < 1e-5f) return;  // behind the camera
+    float eps = _EpsNoise;
+    bool accept = false;
+    if      (rOld == 0.0f)        accept = true;   // first time seing the sample
+    else if (rNew <  rOld - eps)  accept = true;   // new object it's ocludong the surface
+    else if (rNew <= rOld + eps)  accept = true;   // new object it's ocludong the surface
+    else if (rNew > rOld + eps)   accept = (_AllowRecede != 0); // if recede allowance
+    // TODO: que passa amb les mostres que tenen soroll, hauriem de fer un promig? pensar
 
-    float2 sensor_coord = camSpaceCoord.xy / camSpaceCoord.z;
-    // check if it's inside the camera's view
-    if (sensor_coord.x < 0.0f || sensor_coord.x > 1.0f || sensor_coord.y < 0.0f || sensor_coord.y > 1.0f)
-        return;
+    if (!accept) return;
 
-    // Get the color
-    float3 color = _ColorTex.SampleLevel(sampler_ColorTex, sensor_coord, 0).rgb;
-    _ColorEquirect[id.xy] = float4(color, 1.0f);  
+    _DepthEquirect[id.xy] = rNew;
+
+    // Color: project to color camera and sample color
+    float3 X = _MapCenter + rNew * DirFromTexel(id.xy);
+    float3 c = mul(_ColorProjectionMatrix, float4(X, 1.0f)).xyz;
+    if (c.z < 1e-5f) return;
+
+    float2 suv = c.xy / c.z;
+    if (suv.x < 0.0f || suv.x > 1.0f || suv.y < 0.0f || suv.y > 1.0f) return;
+
+    _ColorEquirect[id.xy] = float4(
+        _ColorTex.SampleLevel(sampler_ColorTex, suv, 0).rgb, 1.0f);
 }
