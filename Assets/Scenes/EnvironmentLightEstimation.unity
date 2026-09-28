@@ -512,9 +512,9 @@ MonoBehaviour:
   probeAware: 2
   numSamples: 512
   numCandidates: 16
-  debugDiffuseMap: 1
+  debugDiffuseMap: 0
   debugProbeIndex: 8
-  debugImportanceSampling: 1
+  debugImportanceSampling: 0
   dumpOnce: 1
 --- !u!1 &303377057
 GameObject:
@@ -1391,8 +1391,12 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::EnvironmentMapReconstructor
   m_computeShader: {fileID: 7200000, guid: 0fbe1d2775a16491d90eee6d8be1ddc4, type: 3}
   m_cameraAccess: {fileID: 196347610}
-  m_width: 2048
-  m_height: 1024
+  m_width: 1024
+  m_height: 512
+  m_splatRadius: 1
+  m_epsNoise: 0.05
+  m_epsFootprint: 2
+  m_allowRecede: 1
   m_updateEveryNFrames: 1
   m_scanDriftWarnMeters: 0.3
   m_statusText: {fileID: 303377060}
