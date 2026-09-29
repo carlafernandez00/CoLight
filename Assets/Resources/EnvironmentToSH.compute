@@ -26,6 +26,10 @@ int                 _NumSamples;            // (Importance sampling only) number
 int                 _ImportanceFunction;    // (Importance sampling only) 0 = luminance, 1 = color aware, 2 = uniform (weight 1)  
 int                 _NumCandidates;         // (Importance sampling only) M candidates resampled per output sample
 int                 _DistributionIndex;     // distribution slot to build into / sample from
+Texture2D<float>    _DepthEquirect;         // distance from _MapCenter
+float3              _MapCenter;             // point where the map is centered
+float               _MinDepth;              // to make sure that geometry doen't explode. clap to max radius
+int                 _UseDepth;              // 0 = sphere with fixed radius (old behaviour)
 
 // OUTPUT
 // 9 SH coefficients per probe, one float3 (RGB) per coefficient -> buffer must have (_ProbeIndex + 1) * 9 elements
@@ -115,14 +119,27 @@ float3 DirFromUV(float u, float v)
 }
 
 // ---------------------------------------------------------------------------
+// radial distance from texel
+// ---------------------------------------------------------------------------
+float DepthAt(int2 texel)
+{
+    if (_UseDepth == 0) return _EnvSphereRadius;
+
+    float r = _DepthEquirect.Load(int3(texel, 0));
+    return (r > 0.0f) ? max(r, _MinDepth) : _EnvSphereRadius;
+}
+
+
+// ---------------------------------------------------------------------------
 // Parallax / probe-offset geometric factor.
-//    geom = dΩ_probe / dΩ_env = R² · cos∠(dir, dirProbe) / ‖R·dir − P‖²
+//    geom = dΩ_probe / dΩ_env = R² · cos∠(dir, dirProbe) / ‖C + R·dir − P‖²
 // ---------------------------------------------------------------------------
 float ProbeGeom(float3 dir, float3 probePosition, float R, out float3 dirProbe)
 {
-    float3 Q        = R * dir;                        // point on the virtual sphere
+    float3 Q        = _MapCenter + R * dir;           // point on the virtual sphere
     float3 V        = Q - probePosition;              // direction probe → Q
-    float  distSq   = max(dot(V, V), 1e-6f * R * R);  
+    // float  distSq   = max(dot(V, V), 1e-6f * R * R);  
+    float  distSq   = max(dot(V, V), _MinDepth * _MinDepth); 
     float  dist     = sqrt(distSq);
     dirProbe = V /dist;                        // normalize(Q - P)
     float  cosAngle = dot(dir, dirProbe);
@@ -148,7 +165,6 @@ void ProjectEquirectToSH(uint3 groupID : SV_GroupID, uint threadIndex : SV_Group
 
     // Total solid angle weight for normalization
     gWeight[threadIndex] = 0.0f;
-    float R = _EnvSphereRadius;
 
     // Mip-level loop bounds: each mip halves the resolution (>> is a bitwise right shift)
     int mipW = max(1, _TexWidth  >> _MipLevel);
@@ -179,16 +195,9 @@ void ProjectEquirectToSH(uint3 groupID : SV_GroupID, uint threadIndex : SV_Group
             float dOmega = sinTheta * (PI / mipH) * (2.0f * PI / mipW); // sin(θ) corrects for equirectangular distortion
 
             // 5: parallax correction for probe position 
-            float3 Q        = R * dir;                       // point on the virtual sphere 
-            float3 V        = Q - _ProbePosition;            // direction probe → Q
-            float  distSq   = max(dot(V, V), 1e-6f * R * R); // guard against division by zero
-            float  dist     = sqrt(distSq);
-            float3 dirProbe = V / dist;                      // normalize(Q - P)
-
-            // Solid angle of this patch as seen from probe P:
-            //   dΩ_probe = R² · sin(θ)dθdφ · dot(D_outward_normal, dirProbe) / dist²
-            float cosAngle    = dot(dir, dirProbe);
-            float dOmegaProbe = dOmega * R * R * cosAngle / distSq;
+            float3 dirProbe;
+            float  r          = DepthAt(int2(x, y) << _MipLevel); // per si un cas, no utilitzarem MipLevel anyway
+            float dOmegaProbe = dOmega * ProbeGeom(dir, _ProbePosition, r, dirProbe);
 
             // 6: sample environment color at this direction
             float3 color = _EquirectMap.SampleLevel(sampler_EquirectMap, float2(u, v), _MipLevel).rgb;
@@ -343,7 +352,6 @@ void BuildProbeConditionalCDF(uint3 id : SV_DispatchThreadID)
     float v        = (y + 0.5f) / (float)H;
     float theta    = (1.0f - v) * PI;
     float sinTheta = sin(theta);
-    float R        = _EnvSphereRadius;
 
 
     int cbase = (_DistributionIndex * H + y) * (W + 1);
@@ -362,7 +370,8 @@ void BuildProbeConditionalCDF(uint3 id : SV_DispatchThreadID)
         );
 
         float3 dirProbe;
-        float  geom = ProbeGeom(dir, _ProbePosition, R, dirProbe);
+        float  r    = DepthAt(int2(x, y) << _MipLevel); // per si un cas
+        float  geom = ProbeGeom(dir, _ProbePosition, r, dirProbe);
         
         // importance = luminance · sinθ · geom
         float  func = _ImportanceMap[y * W + x] * sinTheta * geom;   
@@ -594,7 +603,8 @@ Candidate DrawCandidate(uint sampleIndex, uint TOTAL, int W, int H)
 
     // 5: parallax correction for probe position
     float3 dirProbe;
-    float  geom = ProbeGeom(dir, _ProbePosition, _EnvSphereRadius, dirProbe);      // dΩ_probe / dΩ
+    float r = DepthAt(int2(x, y) << _MipLevel); // << _MipLevel per si un cas
+    float geom = ProbeGeom(dir, _ProbePosition, r, dirProbe);      // dΩ_probe / dΩ
     
     // define candidate
     candidate.uv       = float2(u, v);
