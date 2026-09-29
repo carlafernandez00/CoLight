@@ -88,7 +88,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     public ProbeAwareSampling probeAware = ProbeAwareSampling.None;
 
     [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
-    public int numSamples = 2048;
+    public int numSamples = 512;
 
     [Range(1, 24), Tooltip("Candidates resampled per output sample, weighted by the probe's")]
     public int numCandidates = 8;
