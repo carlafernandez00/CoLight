@@ -21,6 +21,15 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Tooltip("Assign EnvironmentToSH.compute")]
     public ComputeShader computeShader;
 
+    [Tooltip("Where the environment comes from.")]
+    public EnvironmentSource environmentSource = EnvironmentSource.Reconstructed;
+
+    [Tooltip("If assigned, SH projection uses the reconstructed panorama instead of the skybox.")]
+    public EnvironmentMapReconstructor reconstructor;
+
+    [Tooltip("Where the ambient probe is evaluated. Avatar transform here. If null, it uses the panorama center.")]
+    public Transform ambientProbeAnchor;
+
     [Header("Settings")]
     [Tooltip("Update automatically every N frames. 0 = manual only.")]
     public int updateEveryNFrames = 30;  // if 0, only update when UpdateSH() is called manually
@@ -35,6 +44,18 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
     [Range(0, 6), Tooltip("Mip level of the environment texture to sample. 0 = full res, 1 = half, 2 = quarter, etc.")]
     public int mipLevel = 0;
+
+    [Tooltip("Uses the depth map for the parallax calculation. Deactivated, comes back to the sphere of radius envSphereRadius.")]
+    public bool useDepthMap = true;
+
+    [Range(0.05f, 1f), Tooltip("Minimum distance (m). Prevents geom from exploding when the probe touches a surface.")]
+    public float minDepth = 0.15f;
+
+    public enum EnvironmentSource
+    {
+        Reconstructed,   
+        Skybox           
+    }
 
     public enum ProjectionMethod
     {
@@ -86,6 +107,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Tooltip("Write the dump only on the first update, then stop (avoids rewriting the same files every N frames).")]
     public bool dumpOnce = true; 
 
+    [Header("Debug profiling")]
+    [Tooltip("Save profiling information into a csv.")]
+    public bool debugProfiling = false;
+
     // Internal
     private ComputeBuffer _shBuffer;
     private float[]       _shRaw;
@@ -98,6 +123,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _activeKernel;
     private int           _frameCounter;
     private Texture       _currentEnvTex;
+    private int           _mip;              // effective mipLevel 
     private LightProbes   _runtimeProbes;
     private RenderTexture _diffuseRenderTexture;          // debug map written by the active kernel
     private Vector3       _debugProbePos;                 // world position of the probe being debugged (for the filename)
@@ -180,20 +206,23 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // Profiling log setup.
         // Editor: project-relative Debug folder (easy to find in Finder).
         // Device: persistentDataPath is the only writable location on Android/Quest.
-        #if UNITY_EDITOR
+        if (debugProfiling)
+        {
+            #if UNITY_EDITOR
                 _profileLogPath = Path.Combine(Application.dataPath, "Debug", "Profiling", "SHProfiler.csv");
-        #else
-                _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
-        #endif
-        Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
-        File.WriteAllText(_profileLogPath,"frame,mode,importance,probeCount,samples,candidates,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
-        Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
-
+            #else
+                    _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
+            #endif
+            Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
+            File.WriteAllText(_profileLogPath,"frame,source,mode,importance,probeCount,samples,candidates,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
+            Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
+        }
+    
         // Create a detached LightProbes clone and make it the active probe set.
         // This must happen before UpdateSH() so all writes go to the owned copy.
         InitRuntimeProbes();
 
-        TryFetchSkyboxTexture();
+        AcquireEnvTexture();
         if (_currentEnvTex != null)
             UpdateSH();
     }
@@ -220,12 +249,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
         {
             _frameCounter = 0;
             // Re-fetch in case the skybox material/texture changed at runtime
-            TryFetchSkyboxTexture();
+            AcquireEnvTexture();
 
             if (_currentEnvTex != null)
                 UpdateSH();
-            else
-                Debug.LogWarning("[EnvironmentSHUpdater] No equirect texture found in skybox material.");
+            else if (environmentSource == EnvironmentSource.Reconstructed && reconstructor == null)
+                Debug.LogWarning("[EnvironmentSHUpdater] No reconstructor assigned.");
         }
         
     }
@@ -242,7 +271,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     {
         if (_currentEnvTex == null)
         {
-            TryFetchSkyboxTexture();
+            AcquireEnvTexture();
             if (_currentEnvTex == null)
             {
                 Debug.LogWarning("[EnvironmentSHUpdater] Cannot update SH: no texture available.");
@@ -269,9 +298,40 @@ public class EnvironmentSHUpdater : MonoBehaviour
     public void ResetSampleDump() => _sampleDumpWritten = false;
 
     // -----------------------------------------------------------------------
+    // reconstructor texture fetch
+    // -----------------------------------------------------------------------
+    private void AcquireEnvTexture()
+    {
+        if (environmentSource == EnvironmentSource.Skybox)
+        {
+            TryFetchSkyboxTexture();
+            return;
+        }
+        _currentEnvTex = (reconstructor != null && reconstructor.IsReady)
+            ? reconstructor.ColorEquirect
+            : null;
+    }
+
+    // Mip requested is only valid if the texture has a mip chain
+    private int EffectiveMip()
+    {
+        var rt = _currentEnvTex as RenderTexture;
+        if (rt != null && !rt.useMipMap) return 0;
+        return mipLevel;
+    }
+
+    // Change amnbient probe position to the one from the avatar. 
+    // ambient probe is a fallback probe when the others are not available
+    private Vector3 AmbientProbePosition()
+    {
+        if (ambientProbeAnchor != null) return ambientProbeAnchor.position;
+        if (reconstructor != null)      return reconstructor.MapCenter;
+        return Vector3.zero;
+    }
+
+    // -----------------------------------------------------------------------
     // Skybox texture fetch
     // -----------------------------------------------------------------------
-
     private void TryFetchSkyboxTexture()
     {
         Material skyMat = RenderSettings.skybox;
@@ -349,7 +409,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         
 
         var probePos = new Vector3[probeCount];
-        probePos[0] = Vector3.zero;                   // ambient probe lives at the origin
+        probePos[0] = AmbientProbePosition();                   // get ambient probe position
         for (int i = 0; i < bakedCount; i++)
             probePos[i + 1] = (positions != null && i < positions.Length) ? positions[i] : Vector3.zero;
 
@@ -366,14 +426,27 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _activeKernel = SelectKernel();
 
         // 1. Global constants (SetInt/SetFloat are shared across all kernels)
+        _mip = EffectiveMip();
+
+        bool useReconstructed = environmentSource == EnvironmentSource.Reconstructed
+                                && reconstructor != null;
+
+        bool depthOK = useReconstructed
+                       && useDepthMap
+                       && reconstructor.DepthEquirect != null;
+
         computeShader.SetInt   ("_TexWidth",        _currentEnvTex.width);
         computeShader.SetInt   ("_TexHeight",       _currentEnvTex.height);
         computeShader.SetFloat ("_EnvSphereRadius", envSphereRadius);
-        computeShader.SetInt   ("_MipLevel",        mipLevel);
+        computeShader.SetInt   ("_MipLevel",        _mip);
         computeShader.SetInt   ("_NumSamples",      numSamples);
         computeShader.SetInt   ("_NumCandidates",   numCandidates);
         computeShader.SetInt   ("_ImportanceFunction", (int)importanceFunction);
         computeShader.SetInt   ("_DebugProbeIndex", (debugDiffuseMap || saveSampleDump) ? debugProbeIndex : -1);
+
+        computeShader.SetInt   ("_UseDepth",   depthOK ? 1 : 0);
+        computeShader.SetFloat ("_MinDepth",   minDepth);
+        computeShader.SetVector("_MapCenter",  useReconstructed ? reconstructor.MapCenter : Vector3.zero);
 
         if (saveSampleDump) computeShader.EnableKeyword("DEBUG_IMPORTANCE_SAMPLING");
         else                computeShader.DisableKeyword("DEBUG_IMPORTANCE_SAMPLING");
@@ -384,8 +457,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _swBuild.Reset();
         if (UsesSampling)
         {
-            int mipW = Mathf.Max(1, _currentEnvTex.width  >> mipLevel);
-            int mipH = Mathf.Max(1, _currentEnvTex.height >> mipLevel);
+            int mipW = Mathf.Max(1, _currentEnvTex.width  >> _mip);
+            int mipH = Mathf.Max(1, _currentEnvTex.height >> _mip);
 
             // if per-probe distrobution, one CDF slot per probe, otherwise 1
             EnsureDistributionBuffers(mipW, mipH, UsesPerProbe ? probeCount : 1);
@@ -398,7 +471,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
             } 
 
             _swBuild.Start();
-            BuildDistributions(mipH, probePos, saveSampleDump);
+            BuildDistributions(mipH, probePos, saveSampleDump, depthOK);
             _swBuild.Stop();
 
             // Bind the distribution buffers to the sampling kernel
@@ -409,6 +482,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // 1b. Bind common resources to the active kernel
         computeShader.SetTexture(_activeKernel, "_EquirectMap", _currentEnvTex);
         computeShader.SetBuffer (_activeKernel, "_SHCoeffs",    _shBuffer);
+        computeShader.SetTexture(_activeKernel, "_DepthEquirect", 
+                    depthOK ? (Texture)reconstructor.DepthEquirect : Texture2D.blackTexture); // to avoid error, not used anyway
 
         if (debugDiffuseMap) computeShader.EnableKeyword("DEBUG_DIFFUSE_MAP");
         else                 computeShader.DisableKeyword("DEBUG_DIFFUSE_MAP");
@@ -421,9 +496,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetInt("_OutHeight", debugDiffuseMap ? mapH : 0);
 
         // 2. Dispatch probes and set their world-space positions for parallax correction
-        // Dispatch for ambient probe (slot 0) — always computed from world origin
         _swDispatch.Restart();
-        _debugProbePos = Vector3.zero;   // probe 0 (ambient) lives at the origin
+        _debugProbePos = Vector3.zero;   // probe 0 (ambient) 
         for (int p = 0; p < probeCount; p++)
         {
             if (p == debugProbeIndex) _debugProbePos = probePos[p];   // remember for the filename
@@ -459,23 +533,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _swTotal.Stop();
 
         // 7. Log profiling results
-        double buildS    = _swBuild.Elapsed.TotalSeconds;
-        double dispatchS = _swDispatch.Elapsed.TotalSeconds;
-        double readbackS = _swReadback.Elapsed.TotalSeconds;
-        double totalS    = _swTotal.Elapsed.TotalSeconds;
-        int    samples   = UsesSampling ? numSamples : 0;
-        int    cands     = UsesSampling ? EffectiveCandidates : 0;
-        string impFunc   = UsesSampling ? importanceFunction.ToString() : "N/A";
-        string mode      = ModeTag();
-
-        Debug.Log($"[EnvironmentSHUpdater] SH updated ({mode}/{impFunc}) — " +
-                  $"Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
-                  $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
-
-        File.AppendAllText(_profileLogPath, string.Format(CultureInfo.InvariantCulture,
-            "{0},{1},{2},{3},{4},{5},{6},{7:F6},{8:F6},{9:F6},{10:F6}\n",
-            Time.frameCount, mode, impFunc, probeCount, samples, cands, mipLevel,
-            buildS, dispatchS, readbackS, totalS));
+        if (debugProfiling)
+        {
+            LogProfilingResults(ambientSH, probeCount, bakedCount);
+        }
 
         // 8. Dump the debug map to disk
         if (debugDiffuseMap)
@@ -512,6 +573,29 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _diffuseRenderTexture.Create();
     }
 
+    private void LogProfilingResults(SphericalHarmonicsL2 ambientSH, int probeCount, int bakedCount)
+    {
+        double buildS    = _swBuild.Elapsed.TotalSeconds;
+        double dispatchS = _swDispatch.Elapsed.TotalSeconds;
+        double readbackS = _swReadback.Elapsed.TotalSeconds;
+        double totalS    = _swTotal.Elapsed.TotalSeconds;
+        int    samples   = UsesSampling ? numSamples : 0;
+        int    cands     = UsesSampling ? EffectiveCandidates : 0;
+        string impFunc   = UsesSampling ? importanceFunction.ToString() : "N/A";
+        string mode      = ModeTag();
+
+        Debug.Log($"[EnvironmentSHUpdater] SH updated ({mode}/{impFunc}) — " +
+                $"Band0 R={ambientSH[0,0]:F6} G={ambientSH[1,0]:F6} B={ambientSH[2,0]:F6} | {bakedCount} baked probe(s) | " +
+                $"build={buildS:F6}s dispatch={dispatchS:F6}s readback={readbackS:F6}s total={totalS:F6}s");
+
+        if (string.IsNullOrEmpty(_profileLogPath)) return;
+
+        File.AppendAllText(_profileLogPath, string.Format(CultureInfo.InvariantCulture,
+            "{0},{1},{2},{3},{4},{5},{6},{7},{8:F6},{9:F6},{10:F6},{11:F6}\n",
+            Time.frameCount, environmentSource, mode, impFunc, probeCount, samples, cands, _mip,
+            buildS, dispatchS, readbackS, totalS));
+    }
+
     // Reads the debug map back from the GPU and writes it to Assets/Debug/SHProbe as
     // a PNG. Filename encodes the probe index, projection method, and world position
     // of the visualized probe. PNG is 8-bit, so HDR values above 1 clamp — fine for a
@@ -537,7 +621,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Vector3 p = _debugProbePos;
         string posStr    = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
         string paramsStr = UsesSampling ? $"_N={numSamples}_M={EffectiveCandidates}_{importanceFunction}" : "";
-        string fileName  = $"SHProbe_idx{debugProbeIndex}_{ModeTag()}{paramsStr}_mip{mipLevel}_{posStr}.exr";
+        string fileName  = $"SHProbe_idx{debugProbeIndex}_{ModeTag()}{paramsStr}_mip{_mip}_{posStr}.exr";
 
         #if UNITY_EDITOR
                 string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
@@ -578,7 +662,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         string  tag = string.Format(ic,
             "P{0}_{1}_{2}_N{3}_M{4}_mip{5}_{6}x{7}_{8}_R{9:F2}",
             debugProbeIndex, ModeTag(), importanceFunction, numSamples,
-            EffectiveCandidates, mipLevel, W, H, pos, envSphereRadius);
+            EffectiveCandidates, _mip, W, H, pos, envSphereRadius);
 
         var sb = new StringBuilder(1 << 16);
         sb.Append("x,y,count\n");
@@ -625,7 +709,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     // (one thread per row), then the marginal CDF (single thread). Shared by
     // every probe in this update.
     // PerProbeDistribution: then runs one extra pass per probe
-    private void BuildDistributions(int mipH, Vector3[] probePos, bool dumping)
+    private void BuildDistributions(int mipH, Vector3[] probePos, bool dumping, bool depthOK)
     {
         int groups = Mathf.CeilToInt(mipH / 64f);   // both build kernels are [numthreads(64,1,1)]
 
@@ -653,8 +737,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetBuffer(_kernelBuildProbeCond, "_CondCdf",       _condCdfBuffer);
         computeShader.SetBuffer(_kernelBuildProbeCond, "_MarginalFunc",  _marginalFuncBuffer);
         computeShader.SetBuffer(_kernelBuildProbeCond, "_ImportanceMap", _importanceMapBuffer);
+        computeShader.SetTexture(_kernelBuildProbeCond, "_DepthEquirect", 
+                        depthOK ? (Texture)reconstructor.DepthEquirect : Texture2D.blackTexture); // to avoid error, not used anyway
         if (dumping) computeShader.SetBuffer(_kernelBuildProbeCond, "_SampleDensity", _sampleDensityBuffer);
-    
 
         for (int p = 0; p < probePos.Length; p++)
         {

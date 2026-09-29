@@ -27,18 +27,18 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
     [Header("Panorama settings")]
     [Tooltip("Equirectangular map resolution. 2:1 aspect. 2048x1024 is a good default.")]
-    [SerializeField] private int m_width  = 512; //2048;
-    [SerializeField] private int m_height = 256; //1024;
+    [SerializeField] private int m_width  = 1024; //2048;
+    [SerializeField] private int m_height = 512; //1024;
 
     [Header("Scatter")]
-    [Tooltip("Radi del splat en tèxels. 0 a 512x256; puja'l si veus forats.")]
+    [Tooltip("Splat radius in texels. Default: ~1 for 1024x512, Increase if you see holes.")]
     [Range(0f, 4f)]
-    [SerializeField] private float m_splatRadius = 0f;
+    [SerializeField] private float m_splatRadius = 1f;
 
     [Header("Thresholes")]
     [SerializeField] private float m_epsNoise     = 0.05f;
-    [SerializeField] private float m_epsFootprint = 2f;
-    [Tooltip("Permet que una superfície s'allunyi (deixa marxar oclusors).")]
+    // [SerializeField] private float m_epsFootprint = 2f;
+    // [Tooltip("Permet que una superfície s'allunyi (deixa marxar oclusors).")]
     [SerializeField] private bool  m_allowRecede  = true;
 
     [Tooltip("Run the reconstruction every N frames. 1 = every frame.")]
@@ -413,9 +413,6 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         m_computeShader.SetInt("_OutHeight", m_height);
 
         m_computeShader.SetMatrix("_ColorProjectionMatrix", colorProjectionMatrix);
-        m_computeShader.SetVector("_ColorFocal",     intr.FocalLength);
-        m_computeShader.SetVector("_ColorPrincipal", intr.PrincipalPoint);
-        m_computeShader.SetVector("_ColorCropRegion", crop);
 
         m_computeShader.SetVector(MapCenterID, _mapCenter);
         m_computeShader.SetVector(CamPosID, pose.position);
@@ -426,8 +423,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         m_computeShader.SetInt  ("_DepthHeight",  dH);
         m_computeShader.SetFloat("_SplatRadius",  m_splatRadius);
         m_computeShader.SetFloat("_EpsNoise",     m_epsNoise);
-        m_computeShader.SetFloat("_EpsFootprint", m_epsFootprint);
-        m_computeShader.SetFloat("_TexelAngle",   Mathf.PI / m_height);
+        // m_computeShader.SetFloat("_EpsFootprint", m_epsFootprint);
+        // m_computeShader.SetFloat("_TexelAngle",   Mathf.PI / m_height);
         m_computeShader.SetInt  ("_AllowRecede",  m_allowRecede ? 1 : 0);
 
         // depth params from Meta Global
@@ -465,7 +462,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             int dGroupsX = Mathf.CeilToInt(dW / 8f);
             int dGroupsY = Mathf.CeilToInt(dH / 8f);
 
-            m_computeShader.Dispatch(_kernelScatter, groupsX, groupsY, 1);
+            m_computeShader.Dispatch(_kernelScatter, dGroupsX, dGroupsY, 1);
 
             // step 2: resolve. update the winning depth and gather colour from it
             m_computeShader.SetTexture(_kernelResolve, ColorTexID, colorTex);
