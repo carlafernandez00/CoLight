@@ -28,9 +28,6 @@ int _OutHeight;
 
 // COLOR CAMERA (Meta PassthroughCameraAccess) 
 float4x4 _ColorProjectionMatrix;    // color camera projection matrix
-float2   _ColorFocal;               // intrinsics focal length (sensor px)
-float2   _ColorPrincipal;           // intrinsics principal point (sensor px) -> center of projection
-float4   _ColorCropRegion;          // (x, y, width, height) sensor crop, in sensor px
 
 float3   _MapCenter;                // world-space camera position at scan time -> maps anchored here (color camera position)
 float3   _CameraPos;                // current world-space camera position (from the pose of the passthrough camera)
@@ -53,8 +50,8 @@ int   _DepthHeight;
 float _SplatRadius;     // 0 = only central texel from the splat
 
 float _EpsNoise;        // m, soroll base del depth
-float _EpsFootprint;    // multiplicador de la petjada angular del texel
-float _TexelAngle;      // PI / _OutHeight, en radians
+// float _EpsFootprint;    // multiplicador de la petjada angular del texel
+// float _TexelAngle;      // PI / _OutHeight, en radians
 int   _AllowRecede;     // 1 = accepta que una superficie s'allunyi
 
 
