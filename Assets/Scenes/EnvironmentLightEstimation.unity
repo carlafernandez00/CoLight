@@ -504,8 +504,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::EnvironmentSHUpdater
   computeShader: {fileID: 7200000, guid: 24031573dbe694efd9311aad6f5d413f, type: 3}
   environmentSource: 0
-  reconstructor: {fileID: 0}
-  ambientProbeAnchor: {fileID: 0}
+  reconstructor: {fileID: 1253898667}
+  ambientProbeAnchor: {fileID: 2073603883}
   updateEveryNFrames: 30
   envSphereRadius: 10
   intensityMultiplier: 1
@@ -1401,7 +1401,6 @@ MonoBehaviour:
   m_height: 512
   m_splatRadius: 1
   m_epsNoise: 0.05
-  m_epsFootprint: 2
   m_allowRecede: 1
   m_updateEveryNFrames: 1
   m_scanDriftWarnMeters: 0.3
@@ -2046,6 +2045,11 @@ PrefabInstance:
     m_AddedGameObjects: []
     m_AddedComponents: []
   m_SourcePrefab: {fileID: 100100000, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+--- !u!4 &2073603883 stripped
+Transform:
+  m_CorrespondingSourceObject: {fileID: -8679921383154817045, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+  m_PrefabInstance: {fileID: 2073603882}
+  m_PrefabAsset: {fileID: 0}
 --- !u!1 &2123604210
 GameObject:
   m_ObjectHideFlags: 0
