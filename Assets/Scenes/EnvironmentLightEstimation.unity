@@ -503,10 +503,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::EnvironmentSHUpdater
   computeShader: {fileID: 7200000, guid: 24031573dbe694efd9311aad6f5d413f, type: 3}
-  environmentSource: 0
+  environmentSource: 1
   reconstructor: {fileID: 1253898667}
   ambientProbeAnchor: {fileID: 2073603883}
   updateEveryNFrames: 30
+  maxProbes: 0
   envSphereRadius: 10
   intensityMultiplier: 1
   mipLevel: 0
@@ -515,13 +516,14 @@ MonoBehaviour:
   method: 1
   importanceFunction: 1
   probeAware: 2
-  numSamples: 512
+  numSamples: 256
   numCandidates: 16
   debugDiffuseMap: 0
-  debugProbeIndex: 8
+  debugProbeIndex: 1
   debugImportanceSampling: 0
   dumpOnce: 1
-  debugProfiling: 0
+  debugProfiling: 1
+  profilingSyncReadback: 1
 --- !u!1 &303377057
 GameObject:
   m_ObjectHideFlags: 0
@@ -685,6 +687,22 @@ LightProbeGroup:
   m_GameObject: {fileID: 317906632}
   m_Enabled: 1
   m_SourcePositions:
+  - {x: -2.6912496, y: 0, z: 9.692785}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: 6.308752, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: -8.307215}
+  - {x: -11.691249, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 9, z: 0.6927843}
+  - {x: -2.6912496, y: -9, z: 0.6927843}
+  - {x: -2.6912496, y: -4.4266996, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 0.6927843}
+  - {x: -2.6912496, y: 0, z: 1.5984364}
   - {x: 0, y: 0, z: 9}
   - {x: 0, y: 0, z: 0}
   - {x: 9, y: 0, z: 0}
@@ -693,6 +711,46 @@ LightProbeGroup:
   - {x: 0, y: 9, z: 0}
   - {x: 0, y: -9, z: 0}
   - {x: 0, y: -4.4266996, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: 0, z: 0.9056519}
+  - {x: 0, y: 0, z: 9.692785}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 9, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: -8.307215}
+  - {x: -9, y: 0, z: 0.6927843}
+  - {x: 0, y: 9, z: 0.6927843}
+  - {x: 0, y: -9, z: 0.6927843}
+  - {x: 0, y: -4.4266996, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 0.6927843}
+  - {x: 0, y: 0, z: 1.5984364}
+  - {x: 2.09215, y: 0, z: 9.692785}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 11.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: -8.307215}
+  - {x: -6.90785, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 9, z: 0.6927843}
+  - {x: 2.09215, y: -9, z: 0.6927843}
+  - {x: 2.09215, y: -4.4266996, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 0.6927843}
+  - {x: 2.09215, y: 0, z: 1.5984364}
   m_Dering: 1
 --- !u!4 &317906634
 Transform:
@@ -918,6 +976,65 @@ Transform:
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 1043260789}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &590573614
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 590573616}
+  - component: {fileID: 590573615}
+  m_Layer: 0
+  m_Name: SH Profiling Sweep
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 0
+--- !u!114 &590573615
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 590573614}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 91e0391731e7b448eab898d9f1c16086, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::SHProfilingSweep
+  updater: {fileID: 283859388}
+  startDelaySeconds: 10
+  warmupUpdates: 10
+  measuredUpdates: 50
+  framesBetweenUpdates: 2
+  method: 1
+  importanceFunction: 1
+  probeAware: 2
+  mipLevel: 0
+  runSampleSweep: 1
+  sampleSweep: 200000004000000080000000000100000002000000040000
+  fixedProbes: 9
+  runProbeSweep: 1
+  probeSweep: 010000000400000009000000100000001900000024000000
+  fixedSamples: 512
+--- !u!4 &590573616
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 590573614}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &782954656
 GameObject:
@@ -1405,9 +1522,12 @@ MonoBehaviour:
   m_updateEveryNFrames: 1
   m_scanDriftWarnMeters: 0.3
   m_statusText: {fileID: 303377060}
-  m_colorPreview: {fileID: 8745435}
-  m_depthPreview: {fileID: 1102845166}
+  m_colorPreview: {fileID: 0}
+  m_depthPreview: {fileID: 0}
   m_depthPreviewMaxMeters: 3
+  debugProfiling: 1
+  profilingSyncDispatch: 1
+  profilingWarmupDispatches: 10
 --- !u!4 &1253898668
 Transform:
   m_ObjectHideFlags: 0
@@ -2245,3 +2365,4 @@ SceneRoots:
   - {fileID: 1253898668}
   - {fileID: 1647909887}
   - {fileID: 2073603882}
+  - {fileID: 590573616}

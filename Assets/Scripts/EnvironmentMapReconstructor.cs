@@ -1,6 +1,11 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
 using Meta.XR;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
+using Debug = UnityEngine.Debug;
 
 /// <summary>
 /// Reconstructs an equirectangular (panoramic 2D) environment map from the Quest 3
@@ -10,7 +15,7 @@ using UnityEngine.UI;
 /// Two aligned panoramas are produced (same layout, same texel = same direction):
 ///   - Color panorama : linear RGB, alpha channel 0 = not yet seen.
 ///   - Depth panorama : radial distance from C,   0 = not yet seen.
-/// 
+///
 /// Notice:
 ///   - Color and depth sensors are treated as ~coincident at the head for the depth
 ///     projection (they differ by a few cm of lens offset).
@@ -61,6 +66,20 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     [Tooltip("Fallback depth (m) mapped to black in the depth preview, used until the first measured range arrives.")]
     [SerializeField] private float m_depthPreviewMaxMeters = 4f;
 
+    [Header("Debug profiling")]
+    [Tooltip("Append one CSV row per reconstruction dispatch. One file per state (Scanning / Tracking) " +
+             "and panorama resolution. Turn OFF while profiling the SH updater — the GPU flush below " +
+             "would perturb those measurements.")]
+    public bool debugProfiling = false;
+
+    [Tooltip("Force a GPU flush (1-texel readback) after the dispatches so total_ms covers GPU execution " +
+             "and not just the CPU enqueue. Intrusive by design: it measures the step's cost in isolation, " +
+             "which is what makes it comparable with the SH updater's number.")]
+    public bool profilingSyncDispatch = true;
+
+    [Tooltip("Dispatches discarded at the start of each state before rows are written.")]
+    public int profilingWarmupDispatches = 10;
+
     // ── Public outputs ────────────────────────────────────────────────────────
     /// <summary>Equirectangular color panorama (linear RGB). Feed to EnvironmentSHUpdater.</summary>
     public RenderTexture ColorEquirect => _colorRT;
@@ -81,8 +100,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private State _state = State.Idle;
     private RenderTexture _colorRT;
     private RenderTexture _depthRT;
-    private RenderTexture _colorDisplayRT;  
-    private RenderTexture _depthDisplayRT;  
+    private RenderTexture _colorDisplayRT;
+    private RenderTexture _depthDisplayRT;
     private Material      _colorVizMat;
     private Material      _depthVizMat;
     private ComputeBuffer _depthAccum;
@@ -92,6 +111,18 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     private int _frameCounter;
     private bool _dispatchPending;   // Update() decides, OnBeforeRenderDispatch() dispatches
 
+    // Profiling state
+    private readonly Stopwatch _swRecon = new Stopwatch();
+    private string _profileLogPath;
+    private string _profileSignature;
+    private int    _dispatchesThisState;   // reset on every state change, drives the warm-up skip
+    private int    _lastDepthW, _lastDepthH;
+
+#if UNITY_EDITOR
+    private const string PlatformTag = "Editor";
+#else
+    private const string PlatformTag = "Quest";
+#endif
 
     // Debug logging state — one-shot flags so we log transitions, not every frame.
     private bool _loggedWaiting, _loggedPlaying, _loggedFirstFrame, _loggedFirstDispatch, _loggedNullTex;
@@ -115,6 +146,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     #if UNITY_EDITOR
             // Passthrough + depth are unavailable in the editor; keep the camera access
             // component from erroring and disable this reconstructor.
+            // NOTE: this is why the reconstructor cannot appear in a local-vs-Quest table —
+            // it has no local counterpart to measure.
             if (m_cameraAccess != null) m_cameraAccess.enabled = false;
             enabled = false;
     #endif
@@ -125,6 +158,9 @@ public class EnvironmentMapReconstructor : MonoBehaviour
     #if !UNITY_EDITOR
         Application.onBeforeRender += OnBeforeRenderDispatch;
     #endif
+        _profileSignature = null;
+        _profileLogPath   = null;
+        _dispatchesThisState = 0;
     }
 
     private void OnDisable()
@@ -150,6 +186,11 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         _kernelClear = m_computeShader.FindKernel("ClearDepthAccumulation");
         _kernelScatter = m_computeShader.FindKernel("ObtainDepth");
         _kernelResolve = m_computeShader.FindKernel("ResolveDepthAndColor");
+
+        if (debugProfiling && (m_colorPreview != null || m_depthPreview != null))
+            Debug.LogWarning("[EnvReconstruct] debugProfiling is ON with the debug previews assigned. " +
+                             "The preview blits are excluded from the timing, but they still cost GPU time " +
+                             "every dispatch — disable the preview RawImages for clean measurements.");
 
         // Material used to paint unseen texels (alpha 0) magenta in the color preview.
         if (m_colorPreview != null)
@@ -181,8 +222,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         // enableRandomWrite true to allow writing at any texel
         _colorRT = new RenderTexture(m_width, m_height, 0, RenderTextureFormat.ARGBHalf)
         {
-            enableRandomWrite = true,      
-            useMipMap = false,                   
+            enableRandomWrite = true,
+            useMipMap = false,
             name = "EnvColorEquirect"
         };
         _colorRT.Create();
@@ -213,7 +254,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             _colorDisplayRT.Create();
 
             // clear to magenta so the panel is visible on the canvas before the first dispatch
-            ClearRT(_colorDisplayRT, Color.magenta);   
+            ClearRT(_colorDisplayRT, Color.magenta);
             m_colorPreview.texture = _colorDisplayRT;
         }
         else if (m_colorPreview != null)
@@ -230,7 +271,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
                 name = "EnvDepthEquirectDisplay"
             };
             _depthDisplayRT.Create();
-            
+
             // Clear to black so the panel is visible on the canvas before the first dispatch
             ClearRT(_depthDisplayRT, Color.black);
             m_depthPreview.texture = _depthDisplayRT;
@@ -254,26 +295,28 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             return;
         }
         ResetMaps();
-    
+
         _mapCenter = m_cameraAccess.GetCameraPose().position;
         _state = State.Scanning;
         ScanDrift = 0f;
+        _dispatchesThisState = 0;   // restart the profiling warm-up for this state
 
         SetStatus("Scanning started. Stand still and look around. Press A when done.");
     }
 
     public void FinishScanning()
     {
-        if (_state != State.Scanning) 
+        if (_state != State.Scanning)
         {
             Debug.LogWarning("[EnvReconstruct] Cannot finish scanning: not currently scanning.");
             return;
         }
 
         _state = State.Tracking;
+        _dispatchesThisState = 0;   // restart the profiling warm-up for this state
         SetStatus("Scanning finished. Tracking! you can walk around now :)");
     }
-    
+
     private void SetStatus(string s, bool log = true)
     {
         if (log) Debug.Log($"[EnvReconstruct] {s}");
@@ -364,13 +407,17 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         // If the color camera is not delivering frames yet, skip this update.
         if (colorTex == null)
         {
-            if (!_loggedNullTex) 
-            { 
-                Debug.LogWarning("[EnvReconstruct] Camera is playing but GetTexture() returned null — no color frame yet."); 
-                _loggedNullTex = true; 
+            if (!_loggedNullTex)
+            {
+                Debug.LogWarning("[EnvReconstruct] Camera is playing but GetTexture() returned null — no color frame yet.");
+                _loggedNullTex = true;
             }
             return;
         }
+
+        // Everything from here on is the measured step: CPU setup + binds + dispatches.
+        bool profiling = debugProfiling;
+        if (profiling) _swRecon.Restart();
 
         var intr = m_cameraAccess.Intrinsics;
         Pose pose = m_cameraAccess.GetCameraPose();
@@ -385,7 +432,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             sensorRes.y * (1f - scale.y) * 0.5f,    // top left (coord y) of the crop region in sensor space
             sensorRes.x * scale.x,                  // width of the crop region in sensor space
             sensorRes.y * scale.y);                 // height of the crop region in sensor space
-        
+
         // Define color camera projection matrix: P = K * [R|t]; for K considering the crop region
         Matrix4x4 invCameraPose = Matrix4x4.TRS(pose.position, pose.rotation, Vector3.one).inverse;
         Matrix4x4 K = Matrix4x4.identity;
@@ -404,9 +451,11 @@ public class EnvironmentMapReconstructor : MonoBehaviour
 
         // Depth map dimensions
         var depthTex = Shader.GetGlobalTexture(DepthTexGlobalName);
-        if (depthTex == null) return;                 // no depth frame yet
+        if (depthTex == null) { if (profiling) _swRecon.Reset(); return; }   // no depth frame yet — nothing to log
         int dW = depthTex.width;
         int dH = depthTex.height;
+        _lastDepthW = dW;
+        _lastDepthH = dH;
 
         // BIND EVERYTHING
         m_computeShader.SetInt("_OutWidth",  m_width);
@@ -440,8 +489,8 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             m_computeShader.SetTexture(_kernelScan, ColorTexID, colorTex);
             m_computeShader.SetTexture(_kernelScan, ColorEquirectID, _colorRT);
             m_computeShader.SetTexture(_kernelScan, DepthEquirectID, _depthRT);
-            
-            // depth texture from Meta global 
+
+            // depth texture from Meta global
             m_computeShader.SetTextureFromGlobal(_kernelScan, DepthTexGlobalName, DepthTexGlobalName);
 
 
@@ -473,7 +522,21 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             m_computeShader.Dispatch(_kernelResolve, groupsX, groupsY, 1);
 
         }
-        
+
+        // Close the measurement BEFORE the debug preview blits, which are not part of the step.
+        if (profiling)
+        {
+            // Dispatch() is asynchronous: without a flush the stopwatch would only cover the CPU
+            // enqueue. A one-texel readback is ordered after the dispatches above and blocks until
+            // they have executed, so total_ms becomes the step's isolated end-to-end cost.
+            if (profilingSyncDispatch) FlushGpu();
+            _swRecon.Stop();
+
+            _dispatchesThisState++;
+            if (_dispatchesThisState > profilingWarmupDispatches)
+                LogProfilingRow(_swRecon.Elapsed.TotalMilliseconds);
+        }
+
         // Refresh the color preview from the updated panorama (unseen -> magenta)
         if (_colorDisplayRT != null && _colorVizMat != null)
             Graphics.Blit(_colorRT, _colorDisplayRT, _colorVizMat);
@@ -484,6 +547,56 @@ public class EnvironmentMapReconstructor : MonoBehaviour
             _depthVizMat.SetFloat(MaxDepthID, m_depthPreviewMaxMeters);
             Graphics.Blit(_depthRT, _depthDisplayRT, _depthVizMat);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiling output
+    // -----------------------------------------------------------------------
+
+    // Reads a single texel of the depth panorama. The request is queued after the
+    // dispatches above, so waiting on it drains the GPU queue for this step.
+    private void FlushGpu()
+    {
+        if (_depthRT == null) return;
+        var req = AsyncGPUReadback.Request(_depthRT, 0, 0, 1, 0, 1, 0, 1);
+        req.WaitForCompletion();
+    }
+
+    // One csv per state and panorama resolution, so Scanning and Tracking never mix.
+    private void EnsureProfileFile()
+    {
+        string sig = string.Format(CultureInfo.InvariantCulture,
+            "{0}_{1}x{2}_splat{3:F1}_every{4}",
+            _state, m_width, m_height, m_splatRadius, m_updateEveryNFrames);
+
+        if (sig == _profileSignature && !string.IsNullOrEmpty(_profileLogPath)) return;
+        _profileSignature = sig;
+
+#if UNITY_EDITOR
+        string dir = Path.Combine(Application.dataPath, "Debug", "Profiling");
+#else
+        string dir = Path.Combine(Application.persistentDataPath, "Profiling");
+#endif
+        Directory.CreateDirectory(dir);
+        _profileLogPath = Path.Combine(dir, $"Recon_{PlatformTag}_{sig}.csv");
+
+        if (!File.Exists(_profileLogPath))
+            File.WriteAllText(_profileLogPath,
+                "frame,platform,state,panoW,panoH,depthW,depthH,splatRadius,everyNFrames,total_ms\n");
+
+        Debug.Log($"[EnvReconstruct] Profiling → {_profileLogPath}");
+    }
+
+    private void LogProfilingRow(double totalMs)
+    {
+        EnsureProfileFile();
+        if (string.IsNullOrEmpty(_profileLogPath)) return;
+
+        File.AppendAllText(_profileLogPath, string.Format(CultureInfo.InvariantCulture,
+            "{0},{1},{2},{3},{4},{5},{6},{7:F2},{8},{9:F4}\n",
+            Time.frameCount, PlatformTag, _state,
+            m_width, m_height, _lastDepthW, _lastDepthH,
+            m_splatRadius, m_updateEveryNFrames, totalMs));
     }
 
     /// <summary>Reset both panoramas to empty.</summary>
@@ -500,6 +613,7 @@ public class EnvironmentMapReconstructor : MonoBehaviour
         _state = State.Idle;
         IsReady = false;
         _dispatchPending = false;   // drop any dispatch Update() queued for the maps we just cleared
+        _dispatchesThisState = 0;
     }
 
     private void OnDestroy()
