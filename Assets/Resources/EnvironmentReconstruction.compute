@@ -116,10 +116,10 @@ bool SampleDepthWorld(float2 ndcXY, float2 uvPos, out float3 worldPoint)
     float4 q1 = mul(_DepthReprojInverse, float4(ndcXY, 0.75f, 1.0f));
     float3 dir = normalize(q1.xyz/q1.w - q0.xyz/q0.w);                       // normalize
 
-    // let's compute the optic axis direction
-    float4 c0 = mul(_DepthReprojInverse, float4(0.0f, 0.0f, 0.25f, 1.0f));   // 0.25 and 0.75 instead of 0, 1 so we don't reach the inf value
-    float4 c1 = mul(_DepthReprojInverse, float4(0.0f, 0.0f, 0.75f, 1.0f));
-    float3 axis = normalize(c1.xyz/c1.w - c0.xyz/c0.w);                      // normalize
+    // // let's compute the optic axis direction
+    // float4 c0 = mul(_DepthReprojInverse, float4(0.0f, 0.0f, 0.25f, 1.0f));   // 0.25 and 0.75 instead of 0, 1 so we don't reach the inf value
+    // float4 c1 = mul(_DepthReprojInverse, float4(0.0f, 0.0f, 0.75f, 1.0f));
+    // float3 axis = normalize(c1.xyz/c1.w - c0.xyz/c0.w);                      // normalize
 
     // distance computed with meta linealization
     float d = LinearDepthMeters(raw_depth);
@@ -127,8 +127,9 @@ bool SampleDepthWorld(float2 ndcXY, float2 uvPos, out float3 worldPoint)
 
     // d is the distance perpendicular to the camera plane, i.e., the distance along the optic axis
     // to compute the distance along the ray: d/cos(theta), cos(theta)=dot(dir, axis)
-    float cosT = max(dot(dir, axis), 1e-4f);   
-    worldPoint = _CameraPos + dir * (d / cosT);
+    // float cosT = max(dot(dir, axis), 1e-4f);   
+    // worldPoint = _CameraPos + dir * (d / cosT);
+    worldPoint = _CameraPos + dir * d;
 
     return true;
 }
