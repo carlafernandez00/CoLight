@@ -453,6 +453,7 @@ GameObject:
   - component: {fileID: 283859387}
   - component: {fileID: 283859386}
   - component: {fileID: 283859388}
+  - component: {fileID: 283859389}
   m_Layer: 0
   m_Name: LightProbeUpdater
   m_TagString: Untagged
@@ -522,6 +523,40 @@ MonoBehaviour:
   debugImportanceSampling: 0
   dumpOnce: 1
   debugProfiling: 1
+  runFolder: 
+  fileTag: 
+--- !u!114 &283859389
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 283859385}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b05dfea5838494b0abe925a7cc9cb83e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::SHExperimentRunner
+  updater: {fileID: 283859388}
+  reconstructor: {fileID: 0}
+  runName: SH_validation_fig4
+  runOnStart: 0
+  runKey: 290
+  runNow: 0
+  settleFrames: 60
+  framesBetweenRuns: 3
+  repeats: 1
+  blockMain: 1
+  blockFigure4: 0
+  baseNumSamples: 512
+  baseImportance: 2
+  diffuseProbes: 000000000100000008000000
+  convergenceProbe: 1
+  convergenceN: 200000004000000080000000000100000002000000040000
+  modeCompareProbe: 0
+  figure4Probe: 0
+  figure4Functions: 020000000000000001000000
+  figure4ProbeAware: 2
 --- !u!1 &303377057
 GameObject:
   m_ObjectHideFlags: 0

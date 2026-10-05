@@ -3,9 +3,9 @@ using System.Diagnostics;
 using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
-using System;                 
-using System.Text;            
-using System.Globalization;   
+using System;
+using System.Text;
+using System.Globalization;
 using Debug = UnityEngine.Debug;
 using Object = UnityEngine.Object;
 
@@ -53,8 +53,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
     public enum EnvironmentSource
     {
-        Reconstructed,   
-        Skybox           
+        Reconstructed,
+        Skybox
     }
 
     public enum ProjectionMethod
@@ -87,7 +87,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
     [Tooltip("How the probe position enters the estimate. ImportanceSampling only.")]
     public ProbeAwareSampling probeAware = ProbeAwareSampling.None;
 
-    [Range(64, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
+    // PATCH 1: lower bound 64 -> 32 so the convergence sweep can reach N=32.
+    [Range(32, 16384), Tooltip("Monte Carlo samples per probe (ImportanceSampling only).")]
     public int numSamples = 512;
 
     [Range(1, 24), Tooltip("Candidates resampled per output sample, weighted by the probe's")]
@@ -105,11 +106,28 @@ public class EnvironmentSHUpdater : MonoBehaviour
     public bool debugImportanceSampling = false;
 
     [Tooltip("Write the dump only on the first update, then stop (avoids rewriting the same files every N frames).")]
-    public bool dumpOnce = true; 
+    public bool dumpOnce = true;
 
     [Header("Debug profiling")]
     [Tooltip("Save profiling information into a csv.")]
     public bool debugProfiling = false;
+
+    // PATCH 2: experiment-runner hooks.
+    [Header("Experiment runner")]
+    [Tooltip("Subfolder under Assets/Debug where this run's dumps go. Empty = default folders.")]
+    public string runFolder = "";
+
+    [Tooltip("Suffix appended to every dumped filename (e.g. _rep0). Set by SHExperimentRunner.")]
+    public string fileTag = "";
+
+    /// <summary>Full path of the last diffuse map written to disk (empty if none yet).</summary>
+    public string LastDiffuseMapPath { get; private set; }
+
+    /// <summary>Tag of the last sample dump written to disk (empty if none yet).</summary>
+    public string LastSampleDumpTag { get; private set; }
+
+    /// <summary>World position of the probe covered by the last dump.</summary>
+    public Vector3 LastDebugProbePos => _debugProbePos;
 
     // Internal
     private ComputeBuffer _shBuffer;
@@ -118,12 +136,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private int           _kernelIS;
     private int           _kernelRIS;
     private int           _kernelBuildCond;
-    private int           _kernelBuildProbeCond; 
+    private int           _kernelBuildProbeCond;
     private int           _kernelBuildMarg;
     private int           _activeKernel;
     private int           _frameCounter;
     private Texture       _currentEnvTex;
-    private int           _mip;              // effective mipLevel 
+    private int           _mip;              // effective mipLevel
     private LightProbes   _runtimeProbes;
     private RenderTexture _diffuseRenderTexture;          // debug map written by the active kernel
     private Vector3       _debugProbePos;                 // world position of the probe being debugged (for the filename)
@@ -142,7 +160,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private uint[]        _sampleCountZeros;
     private float[]       _densityRaw;
     private int           _dumpW, _dumpH;
-    private bool          _sampleDumpWritten;   
+    private bool          _sampleDumpWritten;
 
 
     // Known property names used by Unity's Skybox/Panoramic shader
@@ -158,7 +176,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
     private bool UsesResampling=> UsesSampling && probeAware == ProbeAwareSampling.Resampling;
     private bool UsesPerProbe  => UsesSampling && probeAware == ProbeAwareSampling.PerProbeDistribution;
     private int EffectiveCandidates => UsesResampling ? Mathf.Clamp(numCandidates, 1, 24) : 1;
-    
+
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
@@ -180,13 +198,27 @@ public class EnvironmentSHUpdater : MonoBehaviour
         }
     }
 
+    // PATCH 2: all debug dumps go through here so a sweep can redirect them
+    // into one folder per run.
+    private string DebugDir(string leaf)
+    {
+    #if UNITY_EDITOR
+        string root = Path.Combine(Application.dataPath, "Debug");
+    #else
+        string root = Application.persistentDataPath;
+    #endif
+        return string.IsNullOrEmpty(runFolder)
+            ? Path.Combine(root, leaf)
+            : Path.Combine(root, runFolder, leaf);
+    }
+
 
     void Awake()
     {
         // Disable reflection probes for now
         QualitySettings.realtimeReflectionProbes = false;
         RenderSettings.reflectionIntensity = 0f;
-        
+
         // Custom mode tells Unity to use ambientProbe as-is, without overwriting it from the skybox.
         RenderSettings.ambientMode = AmbientMode.Custom;
     }
@@ -201,23 +233,19 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _kernelBuildMarg      = computeShader.FindKernel("BuildMarginalCDF");
         EnsureBuffer(1); // at minimum one slot for the ambient probe
 
-        _sampleDumpWritten = false; 
+        _sampleDumpWritten = false;
 
         // Profiling log setup.
         // Editor: project-relative Debug folder (easy to find in Finder).
         // Device: persistentDataPath is the only writable location on Android/Quest.
         if (debugProfiling)
         {
-            #if UNITY_EDITOR
-                _profileLogPath = Path.Combine(Application.dataPath, "Debug", "Profiling", "SHProfiler.csv");
-            #else
-                    _profileLogPath = Path.Combine(Application.persistentDataPath, "Profiling", "SHProfiler.csv");
-            #endif
+            _profileLogPath = Path.Combine(DebugDir("Profiling"), "SHProfiler.csv");
             Directory.CreateDirectory(Path.GetDirectoryName(_profileLogPath));
             File.WriteAllText(_profileLogPath,"frame,source,mode,importance,probeCount,samples,candidates,mipLevel,build_s,dispatch_s,readback_s,total_s\n");
             Debug.Log($"[EnvironmentSHUpdater] Profiling log: {_profileLogPath}");
         }
-    
+
         // Create a detached LightProbes clone and make it the active probe set.
         // This must happen before UpdateSH() so all writes go to the owned copy.
         InitRuntimeProbes();
@@ -256,7 +284,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
             else if (environmentSource == EnvironmentSource.Reconstructed && reconstructor == null)
                 Debug.LogWarning("[EnvironmentSHUpdater] No reconstructor assigned.");
         }
-        
+
     }
 
     // -----------------------------------------------------------------------
@@ -279,6 +307,23 @@ public class EnvironmentSHUpdater : MonoBehaviour
             }
         }
         StartCoroutine(ProjectAndApply());
+    }
+
+    // PATCH 5: yieldable variant, so a sweep can chain configurations without
+    // leaving Play mode:  yield return StartCoroutine(updater.UpdateSHRoutine());
+    // It returns only once the dumps for this configuration are on disk.
+    /// <summary>
+    /// Same as UpdateSH(), but yieldable: completes after the debug dumps are written.
+    /// </summary>
+    public IEnumerator UpdateSHRoutine()
+    {
+        if (_currentEnvTex == null) AcquireEnvTexture();
+        if (_currentEnvTex == null)
+        {
+            Debug.LogWarning("[EnvironmentSHUpdater] Cannot update SH: no texture available.");
+            yield break;
+        }
+        yield return ProjectAndApply();
     }
 
     /// <summary>
@@ -320,7 +365,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         return mipLevel;
     }
 
-    // Change amnbient probe position to the one from the avatar. 
+    // Change amnbient probe position to the one from the avatar.
     // ambient probe is a fallback probe when the others are not available
     private Vector3 AmbientProbePosition()
     {
@@ -347,10 +392,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
             if (skyMat.HasProperty(prop))
             {
                 Texture tex = skyMat.GetTexture(prop);
-                if (tex != null) 
-                { 
-                    _currentEnvTex = tex; 
-                    return; 
+                if (tex != null)
+                {
+                    _currentEnvTex = tex;
+                    return;
                 }
             }
         }
@@ -401,12 +446,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
             yield break;
         }
 
-        // Get baked probes and positions 
+        // Get baked probes and positions
         SphericalHarmonicsL2[] bakedProbes = _runtimeProbes.bakedProbes;
         Vector3[]              positions   = _runtimeProbes.positions;
         int bakedCount = bakedProbes != null ? bakedProbes.Length : 0;
         int probeCount = bakedCount + 1;  // bakedCount + 1 : slot 0 reserved for ambient probe
-        
+
 
         var probePos = new Vector3[probeCount];
         probePos[0] = AmbientProbePosition();                   // get ambient probe position
@@ -414,10 +459,10 @@ public class EnvironmentSHUpdater : MonoBehaviour
             probePos[i + 1] = (positions != null && i < positions.Length) ? positions[i] : Vector3.zero;
 
 
-        // Ensure we have enough space in our buffers 
+        // Ensure we have enough space in our buffers
         EnsureBuffer(probeCount);
 
-        bool saveSampleDump = debugImportanceSampling && method == ProjectionMethod.ImportanceSampling 
+        bool saveSampleDump = debugImportanceSampling && method == ProjectionMethod.ImportanceSampling
                                                       && !(dumpOnce && _sampleDumpWritten);
 
         _swTotal.Restart(); // reset + start
@@ -462,13 +507,13 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
             // if per-probe distrobution, one CDF slot per probe, otherwise 1
             EnsureDistributionBuffers(mipW, mipH, UsesPerProbe ? probeCount : 1);
-            
+
             if (saveSampleDump)
             {
                 EnsureSampleDumpBuffers(mipW, mipH);
                 _sampleCountBuffer.SetData(_sampleCountZeros);     // reset hits per texel
                 computeShader.SetBuffer(_activeKernel, "_SampleCount", _sampleCountBuffer);
-            } 
+            }
 
             _swBuild.Start();
             BuildDistributions(mipH, probePos, saveSampleDump, depthOK);
@@ -482,7 +527,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // 1b. Bind common resources to the active kernel
         computeShader.SetTexture(_activeKernel, "_EquirectMap", _currentEnvTex);
         computeShader.SetBuffer (_activeKernel, "_SHCoeffs",    _shBuffer);
-        computeShader.SetTexture(_activeKernel, "_DepthEquirect", 
+        computeShader.SetTexture(_activeKernel, "_DepthEquirect",
                     depthOK ? (Texture)reconstructor.DepthEquirect : Texture2D.blackTexture); // to avoid error, not used anyway
 
         if (debugDiffuseMap) computeShader.EnableKeyword("DEBUG_DIFFUSE_MAP");
@@ -497,7 +542,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         // 2. Dispatch probes and set their world-space positions for parallax correction
         _swDispatch.Restart();
-        _debugProbePos = Vector3.zero;   // probe 0 (ambient) 
+        _debugProbePos = Vector3.zero;   // probe 0 (ambient)
         for (int p = 0; p < probeCount; p++)
         {
             if (p == debugProbeIndex) _debugProbePos = probePos[p];   // remember for the filename
@@ -518,7 +563,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _swReadback.Stop();
 
         // 5. Build SphericalHarmonicsL2 and apply to ambient probe
-        // Apply to global ambient probe (affects all dynamic objects) 
+        // Apply to global ambient probe (affects all dynamic objects)
         var ambientSH = BuildSHL2(_shRaw, 0);
         RenderSettings.ambientProbe = ambientSH * intensityMultiplier;
 
@@ -541,7 +586,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         // 8. Dump the debug map to disk
         if (debugDiffuseMap)
             SaveDiffuseMapToDisk();
-        
+
         // 9. Dump the importance sampling data to disk (texels + hit counts + importance map + env map)
         if (saveSampleDump)
         {
@@ -597,9 +642,9 @@ public class EnvironmentSHUpdater : MonoBehaviour
     }
 
     // Reads the debug map back from the GPU and writes it to Assets/Debug/SHProbe as
-    // a PNG. Filename encodes the probe index, projection method, and world position
-    // of the visualized probe. PNG is 8-bit, so HDR values above 1 clamp — fine for a
-    // quick visual check.
+    // an EXR. Filename encodes the probe index, projection method, and world position
+    // of the visualized probe. EXR keeps the HDR range, so RMSE is computed on real
+    // linear values rather than clamped 8-bit ones.
     private void SaveDiffuseMapToDisk()
     {
         if (_diffuseRenderTexture == null) return;
@@ -621,18 +666,17 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Vector3 p = _debugProbePos;
         string posStr    = string.Format(ic, "pos({0:F2}_{1:F2}_{2:F2})", p.x, p.y, p.z);
         string paramsStr = UsesSampling ? $"_N={numSamples}_M={EffectiveCandidates}_{importanceFunction}" : "";
-        string fileName  = $"SHProbe_idx{debugProbeIndex}_{ModeTag()}{paramsStr}_mip{_mip}_{posStr}.exr";
+        // PATCH 3: fileTag suffix.
+        string fileName  = $"SHProbe_idx{debugProbeIndex}_{ModeTag()}{paramsStr}_mip{_mip}_{posStr}{fileTag}.exr";
 
-        #if UNITY_EDITOR
-                string dir = Path.Combine(Application.dataPath, "Debug", "SHProbe");
-        #else
-                string dir = Path.Combine(Application.persistentDataPath, "SHProbe");
-        #endif
+        // PATCH 3: route through DebugDir so a sweep can group its dumps.
+        string dir = DebugDir("SHProbe");
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, fileName);
 
         // File.WriteAllBytes(path, png);
         File.WriteAllBytes(path, exr);
+        LastDiffuseMapPath = path;                     // PATCH 3: for the run manifest
         Debug.Log($"[EnvironmentSHUpdater] Debug map saved: {path}");
     }
 
@@ -649,11 +693,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _sampleCountBuffer.GetData(_sampleCountRaw);
         _sampleDensityBuffer.GetData(_densityRaw);
 
-        #if UNITY_EDITOR
-                string dir = Path.Combine(Application.dataPath, "Debug", "SH_ImportanceSamples");
-        #else
-                string dir = Path.Combine(Application.persistentDataPath, "SH_ImportanceSamples");
-        #endif
+        // PATCH 4: route through DebugDir so a sweep can group its dumps.
+        string dir = DebugDir("SH_ImportanceSamples");
         Directory.CreateDirectory(dir);
 
         var     ic  = CultureInfo.InvariantCulture;
@@ -663,6 +704,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
             "P{0}_{1}_{2}_N{3}_M{4}_mip{5}_{6}x{7}_{8}_R{9:F2}",
             debugProbeIndex, ModeTag(), importanceFunction, numSamples,
             EffectiveCandidates, _mip, W, H, pos, envSphereRadius);
+        tag += fileTag;                                // PATCH 4
 
         var sb = new StringBuilder(1 << 16);
         sb.Append("x,y,count\n");
@@ -682,19 +724,20 @@ public class EnvironmentSHUpdater : MonoBehaviour
         Buffer.BlockCopy(_densityRaw, 0, bytes, 0, bytes.Length);
         File.WriteAllBytes(Path.Combine(dir, $"Density_{tag}.f32"), bytes);
 
+        LastSampleDumpTag = tag;                       // PATCH 4: for the run manifest
         Debug.Log($"[EnvironmentSHUpdater] Sample dump: {tag}");
     }
- 
+
     // Sizes the sample-dump buffers to the mip dimensions and only rebuilds when they change.
     private void EnsureSampleDumpBuffers(int mipW, int mipH)
     {
         if (_sampleCountBuffer != null && _dumpW == mipW && _dumpH == mipH) return;
- 
+
         _sampleCountBuffer?.Release();
         _sampleDensityBuffer?.Release();
- 
+
         int n = mipW * mipH;
-        _sampleCountBuffer   = new ComputeBuffer(n, sizeof(uint)); 
+        _sampleCountBuffer   = new ComputeBuffer(n, sizeof(uint));
         _sampleDensityBuffer = new ComputeBuffer(n, sizeof(float));
         _sampleCountRaw   = new uint[n];
         _sampleCountZeros = new uint[n];          // cached zero-fill used to clear the histogram
@@ -724,12 +767,12 @@ public class EnvironmentSHUpdater : MonoBehaviour
 
         // Shared distribution → slot 0, compute importance map
         computeShader.SetInt("_DistributionIndex", 0);
-        computeShader.Dispatch(_kernelBuildCond, groups, 1, 1);  // Pass 1 — conditional CDF along u, one thread per row    
+        computeShader.Dispatch(_kernelBuildCond, groups, 1, 1);  // Pass 1 — conditional CDF along u, one thread per row
 
         if (!UsesPerProbe)
         {
             computeShader.Dispatch(_kernelBuildMarg, 1, 1, 1);       // Pass 2 — marginal CDF along v, single thread
-            
+
             return;
         }
 
@@ -737,7 +780,7 @@ public class EnvironmentSHUpdater : MonoBehaviour
         computeShader.SetBuffer(_kernelBuildProbeCond, "_CondCdf",       _condCdfBuffer);
         computeShader.SetBuffer(_kernelBuildProbeCond, "_MarginalFunc",  _marginalFuncBuffer);
         computeShader.SetBuffer(_kernelBuildProbeCond, "_ImportanceMap", _importanceMapBuffer);
-        computeShader.SetTexture(_kernelBuildProbeCond, "_DepthEquirect", 
+        computeShader.SetTexture(_kernelBuildProbeCond, "_DepthEquirect",
                         depthOK ? (Texture)reconstructor.DepthEquirect : Texture2D.blackTexture); // to avoid error, not used anyway
         if (dumping) computeShader.SetBuffer(_kernelBuildProbeCond, "_SampleDensity", _sampleDensityBuffer);
 
@@ -763,8 +806,8 @@ public class EnvironmentSHUpdater : MonoBehaviour
         _marginalCdfBuffer   = new ComputeBuffer(slots * (mipH + 1),        sizeof(float)); // CDF over rows
         _marginalFuncBuffer  = new ComputeBuffer(slots * mipH,              sizeof(float)); // per-row integrals
         _importanceMapBuffer = new ComputeBuffer(mipW * mipH,               sizeof(float)); // probe-independent, single copy
-        _distW = mipW; 
-        _distH = mipH; 
+        _distW = mipW;
+        _distH = mipH;
         _distributionIndex = slots;
 
         float mb = (_condCdfBuffer.count + _marginalCdfBuffer.count +
