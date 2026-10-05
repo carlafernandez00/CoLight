@@ -503,7 +503,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::EnvironmentSHUpdater
   computeShader: {fileID: 7200000, guid: 24031573dbe694efd9311aad6f5d413f, type: 3}
-  environmentSource: 0
+  environmentSource: 1
   reconstructor: {fileID: 1253898667}
   ambientProbeAnchor: {fileID: 2073603883}
   updateEveryNFrames: 30
@@ -521,7 +521,7 @@ MonoBehaviour:
   debugProbeIndex: 8
   debugImportanceSampling: 0
   dumpOnce: 1
-  debugProfiling: 0
+  debugProfiling: 1
 --- !u!1 &303377057
 GameObject:
   m_ObjectHideFlags: 0
