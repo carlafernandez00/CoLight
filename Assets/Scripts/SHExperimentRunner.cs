@@ -18,7 +18,10 @@ using UnityEngine;
 ///   Fig 1  diffuse map  IS-PerProbe vs FullScan vs RMSE, probes {0,1,8}, uniform, N=512
 ///   Fig 2  RMSE vs N    probe 1, uniform, IS-PerProbe, N in {32..1024}, ref = FullScan p1
 ///   Fig 3  sample distribution + density, probes {0,1,8}, IS-PerProbe, uniform, N=512
-///   Fig 5  sample distribution, probe 0, IS-None vs IS-PerProbe, uniform, N=512
+///   Fig 5  sample distribution, one probe, IS-None vs IS-PerProbe, uniform, N=512
+///   Fig 6  the same two methods, with their diffuse maps and a FullScan
+///          reference, so the distributions can be read against the estimate
+///          they produce
 ///   Fig 4  (separate block, needs a different skybox) probe 0, N=512,
 ///          IS-PerProbe with Uniform / Luminance / ColorAware
 /// </summary>
@@ -79,8 +82,11 @@ public class SHExperimentRunner : MonoBehaviour
     public int   convergenceProbe = 1;
     public int[] convergenceN     = { 32, 64, 128, 256, 512, 1024 };
 
-    [Header("Figure 5")]
-    public int modeCompareProbe = 0;
+    [Header("Figures 5 and 6")]
+    [Tooltip("Probe used for the IS-None vs IS-PerProbe comparison. Figure 5 " +
+             "shows its two sample distributions; figure 6 adds the two diffuse " +
+             "maps and a FullScan reference, so both come out of the same runs.")]
+    public int modeCompareProbe = 1;
 
     [Header("Figure 4")]
     public int figure4Probe = 0;
@@ -366,16 +372,26 @@ public class SHExperimentRunner : MonoBehaviour
                 });
             }
 
-            // --- Figure 5: IS-None vs IS-PerProbe sample distribution, probe 0 ---
+            // --- Figures 5 and 6: IS-None vs IS-PerProbe at one probe ---
+            // Figure 5 needs only the sample dumps; figure 6 also needs each
+            // method's diffuse map and a FullScan reference to measure them
+            // against, so both flags are on and the reference is added here.
+            // If this probe is already in diffuseProbes the FullScan run is
+            // deduplicated away.
             Add(new RunCfg {
-                figures = "5", probe = modeCompareProbe, method = IS, probeAware = NONE,
+                figures = "6", probe = modeCompareProbe, method = FS, probeAware = NONE,
                 importance = baseImportance, n = baseNumSamples,
-                wantDiffuse = false, wantSamples = true
+                wantDiffuse = true, wantSamples = false
             });
             Add(new RunCfg {
-                figures = "5", probe = modeCompareProbe, method = IS, probeAware = PER_PROBE,
+                figures = "5,6", probe = modeCompareProbe, method = IS, probeAware = NONE,
                 importance = baseImportance, n = baseNumSamples,
-                wantDiffuse = false, wantSamples = true
+                wantDiffuse = true, wantSamples = true
+            });
+            Add(new RunCfg {
+                figures = "5,6", probe = modeCompareProbe, method = IS, probeAware = PER_PROBE,
+                importance = baseImportance, n = baseNumSamples,
+                wantDiffuse = true, wantSamples = true
             });
         }
 
