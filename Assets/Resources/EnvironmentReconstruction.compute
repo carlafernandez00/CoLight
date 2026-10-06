@@ -258,14 +258,10 @@ void ResolveDepthAndColor(uint3 id : SV_DispatchThreadID)
     float rOld = _DepthEquirect[id.xy];         // Ds stored
 
     float eps = _EpsNoise;
-    bool accept = false;
-    if      (rOld == 0.0f)              accept = true;   // first observation
-    else if (abs(rNew - rOld) <= eps)   accept = false;  // within sensor noise, keep stored
-    else                                accept = true;   // real change, closer or farther
+
+    if (rOld > 0.0f && abs(rNew - rOld) <= eps) rNew = rOld;  // within sensor noise, keep stored
 
     // TODO: que passa amb les mostres que tenen soroll, hauriem de fer un promig? pensar
-
-    if (!accept) return;
 
     _DepthEquirect[id.xy] = rNew;
 
