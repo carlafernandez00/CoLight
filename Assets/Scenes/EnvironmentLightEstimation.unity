@@ -975,7 +975,7 @@ MonoBehaviour:
   m_colorPreview: {fileID: 8745434}
   m_depthPreview: {fileID: 1102845165}
   m_statusText: {fileID: 303377060}
-  m_shotLabel: {fileID: 1549335590}
+  m_shotLabel: {fileID: 0}
   m_mode: 0
   m_cycleButton: 0
   m_bigPanelSize: {x: 420, y: 210}
@@ -1901,7 +1901,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!224 &1549335589
 RectTransform:
   m_ObjectHideFlags: 0
@@ -2319,16 +2319,66 @@ PrefabInstance:
       propertyPath: m_Name
       value: character 1
       objectReference: {fileID: 0}
+    - target: {fileID: 5866666021909216657, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+      propertyPath: m_Controller
+      value: 
+      objectReference: {fileID: 9100000, guid: 4b60883ff456e491b9aa75a6a2c97c5f, type: 2}
+    - target: {fileID: 5866666021909216657, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+      propertyPath: m_WarningMessage
+      value: "\nBinding warning: Some generic clip(s) animate transforms that are
+        already bound by a Humanoid avatar. These transforms can only be changed
+        by Humanoid clips.\n\tTransform 'mixamorig:Hips'\n\tTransform 'mixamorig:LeftFoot'\n\tTransform
+        'mixamorig:LeftHandThumb2'\n\tTransform 'mixamorig:LeftHandIndex1'\n\tTransform
+        'mixamorig:LeftHandPinky2'\n\tTransform 'mixamorig:RightHandRing2'\n\tTransform
+        'mixamorig:Spine1'\n\tTransform 'mixamorig:LeftToeBase'\n\tTransform 'mixamorig:LeftHandThumb3'\n\tTransform
+        'mixamorig:RightArm'\n\tand more ...\n\tFrom animation clip 'Walking'"
+      objectReference: {fileID: 0}
+    - target: {fileID: 5866666021909216657, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+      propertyPath: m_ApplyRootMotion
+      value: 0
+      objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
-    m_AddedComponents: []
+    m_AddedComponents:
+    - targetCorrespondingSourceObject: {fileID: 919132149155446097, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 2073603885}
   m_SourcePrefab: {fileID: 100100000, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
 --- !u!4 &2073603883 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: -8679921383154817045, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
   m_PrefabInstance: {fileID: 2073603882}
   m_PrefabAsset: {fileID: 0}
+--- !u!1 &2073603884 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 919132149155446097, guid: 8e38e4f60bbfc41eaa79c70ad4383056, type: 3}
+  m_PrefabInstance: {fileID: 2073603882}
+  m_PrefabAsset: {fileID: 0}
+--- !u!114 &2073603885
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2073603884}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7c48f7ccdfd11488d8e32117b0968a8e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::AvatarWalkPath
+  m_pointA: {x: -0.8, y: 0, z: 0.9}
+  m_pointB: {x: 0.8, y: 0, z: 0.9}
+  m_speed: 0.4
+  m_dwellSeconds: 1.5
+  m_turnSpeed: 180
+  m_probeBoxCenter: {x: 0, y: 0, z: 0}
+  m_probeBoxHalfExtents: {x: 1.3, y: 1.3}
+  m_margin: 0.3
+  m_animator: {fileID: 0}
+  m_speedParam: 
+  m_walkOnStart: 1
+  m_toggleButton: 0
 --- !u!1 &2123604210
 GameObject:
   m_ObjectHideFlags: 0
