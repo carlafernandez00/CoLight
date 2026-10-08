@@ -26,7 +26,7 @@ RenderSettings:
   m_AmbientIntensity: 0.5
   m_AmbientMode: 0
   m_SubtractiveShadowColor: {r: 0.42, g: 0.478, b: 0.627, a: 1}
-  m_SkyboxMaterial: {fileID: 2100000, guid: 9335e34b1ead04d1bad34e66172c7486, type: 2}
+  m_SkyboxMaterial: {fileID: 2100000, guid: 09eae767eeaef4558afb259f904c2956, type: 2}
   m_HaloStrength: 0.5
   m_FlareStrength: 1
   m_FlareFadeSpeed: 3
@@ -539,15 +539,15 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SHExperimentRunner
   updater: {fileID: 283859388}
   reconstructor: {fileID: 0}
-  runName: validation_fig6
+  runName: validation_fig4_dark
   runOnStart: 0
   runKey: 290
   runNow: 0
   settleFrames: 60
   framesBetweenRuns: 3
   repeats: 1
-  blockMain: 1
-  blockFigure4: 0
+  blockMain: 0
+  blockFigure4: 1
   baseNumSamples: 512
   baseImportance: 2
   diffuseProbes: 000000000100000008000000
