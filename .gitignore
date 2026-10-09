@@ -21,6 +21,7 @@ Recordings/
 .idea/
 *.csproj
 *.sln
+*.slnx
 
 # OS
 .DS_Store
